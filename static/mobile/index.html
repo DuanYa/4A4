@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="screen-orientation" content="landscape">
+    <meta name="x5-orientation" content="landscape">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <title>四幺四横屏移动版</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body {
+            width: 100%; height: 100%; overflow: hidden;
+            background: #061b13; font-family: 'Microsoft YaHei', sans-serif;
+            -webkit-tap-highlight-color: transparent; touch-action: none;
+        }
+        #game-container {
+            position: fixed; inset: 0; width: 100vw; height: 100vh; overflow: hidden;
+            display: flex; align-items: center; justify-content: center;
+        }
+        canvas { display: block; image-rendering: auto; }
+        .mobile-ime-input {
+            position: fixed;
+            z-index: 20;
+            border: 0;
+            outline: none;
+            background: transparent;
+            color: transparent;
+            caret-color: #ffd66b;
+            font-size: 20px;
+            text-align: center;
+            opacity: 0.01;
+            -webkit-user-select: text;
+            user-select: text;
+        }
+        #loading {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            color: #ffd66b; font-size: 22px; font-weight: 700; text-align: center;
+        }
+        #loading.hidden { display: none; }
+        #rotate-hint {
+            display: none; position: fixed; inset: 0; z-index: 9999;
+            background: radial-gradient(circle at center, #124d30, #061b13 70%);
+            color: #fff; align-items: center; justify-content: center; flex-direction: column;
+            text-align: center; padding: 32px;
+        }
+        #rotate-hint.visible { display: flex; }
+        #rotate-hint .phone { font-size: 64px; transform: rotate(90deg); margin-bottom: 18px; }
+        #rotate-hint .title { font-size: 28px; color: #ffd66b; font-weight: 700; margin-bottom: 8px; }
+        #rotate-hint .sub { font-size: 18px; color: rgba(255,255,255,.78); }
+    </style>
+</head>
+<body>
+    <div id="game-container"><div id="loading">加载中...</div></div>
+    <div id="rotate-hint"><div class="phone">▯</div><div class="title">请横屏游玩</div><div class="sub">横屏后可获得完整无遮挡的牌桌布局</div></div>
+    <script src="https://cdn.jsdelivr.net/npm/phaser@3.70.0/dist/phaser.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/socket.io-client@4.7.4/dist/socket.io.min.js"></script>
+    <script src="/mobile/js/utils/logger.js"></script>
+    <script src="/mobile/js/utils/layout.js"></script>
+    <script src="/mobile/js/utils/ui.js"></script>
+    <script src="/mobile/js/utils/ws.js"></script>
+    <script src="/mobile/js/utils/share.js"></script>
+    <script src="/mobile/js/components/Card.js"></script>
+    <script src="/mobile/js/components/Player.js"></script>
+    <script src="/mobile/js/components/PlayZone.js"></script>
+    <script src="/mobile/js/scenes/LobbyScene.js"></script>
+    <script src="/mobile/js/scenes/WaitingScene.js"></script>
+    <script src="/mobile/js/scenes/GameScene.js"></script>
+    <script src="/mobile/js/main.js"></script>
+</body>
+</html>

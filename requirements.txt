@@ -1,0 +1,6 @@
+flask==3.0.0
+flask-socketio==5.3.6
+simple-websocket==1.0.0
+python-socketio[client]>=5.0.0
+websocket-client>=0.54.0
+torch>=2.0.0

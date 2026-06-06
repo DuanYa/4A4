@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>四幺四 (4A4) 扑克游戏</title>
+    <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+    <!-- 大厅界面 -->
+    <div id="lobby" class="screen active">
+        <div class="lobby-container">
+            <h1 class="title">四幺四</h1>
+            <p class="subtitle">4A4 扑克游戏</p>
+            <div class="lobby-form">
+                <input type="text" id="playerName" placeholder="输入你的昵称" maxlength="8">
+                <input type="text" id="roomId" placeholder="房间号（留空自动创建）" maxlength="8">
+                <button id="btnJoin" class="btn btn-primary">加入/创建房间</button>
+            </div>
+            <div id="lobbyMsg" class="msg"></div>
+        </div>
+    </div>
+
+    <!-- 等待界面 -->
+    <div id="waiting" class="screen">
+        <div class="waiting-container">
+            <h2>房间: <span id="roomIdDisplay"></span></h2>
+            <div class="seats-preview">
+                <div class="seat-slot" id="slot0">
+                    <div class="seat-label">座位1 (A队)</div>
+                    <div class="seat-name">等待中...</div>
+                </div>
+                <div class="seat-slot" id="slot1">
+                    <div class="seat-label">座位2 (B队)</div>
+                    <div class="seat-name">等待中...</div>
+                </div>
+                <div class="seat-slot" id="slot2">
+                    <div class="seat-label">座位3 (A队)</div>
+                    <div class="seat-name">等待中...</div>
+                </div>
+                <div class="seat-slot" id="slot3">
+                    <div class="seat-label">座位4 (B队)</div>
+                    <div class="seat-name">等待中...</div>
+                </div>
+            </div>
+            <div class="level-info">
+                <span>A队级别: <b id="levelA">3</b></span>
+                <span>B队级别: <b id="levelB">3</b></span>
+                <span>台上: <b id="onStage">A队</b></span>
+            </div>
+            <div class="ai-options">
+                <label for="aiModelSelect">AI模型</label>
+                <select id="aiModelSelect">
+                    <option value="rule">规则AI</option>
+                    <option value="rl_checkpoint">深度强化学习AI</option>
+                </select>
+                <label for="aiCheckpointSelect">Checkpoint</label>
+                <select id="aiCheckpointSelect">
+                    <option value="default_rl.pt">default_rl.pt</option>
+                </select>
+            </div>
+            <div class="waiting-actions">
+                <button id="btnAddAI" class="btn btn-pass">添加AI补齐</button>
+                <button id="btnStart" class="btn btn-primary" disabled>开始游戏</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 游戏界面 -->
+    <div id="gameScreen" class="screen">
+        <div class="game-info-bar">
+            <span>级牌: <b id="gLevel"></b></span>
+            <span>台上: <b id="gStage"></b></span>
+            <span id="gPhaseText"></span>
+            <button id="btnRestart" class="btn btn-restart">重新开始</button>
+        </div>
+
+        <!-- 对家(上方) -->
+        <div class="player-area top" id="area2">
+            <div class="player-label">
+                <span class="pname" id="pname2"></span>
+                <span class="pcount" id="pcount2"></span>
+            </div>
+            <div class="player-cards back-cards" id="pcards2"></div>
+        </div>
+
+        <!-- 左家 -->
+        <div class="player-area left" id="area1">
+            <div class="player-label">
+                <span class="pname" id="pname1"></span>
+                <span class="pcount" id="pcount1"></span>
+            </div>
+            <div class="player-cards back-cards vertical" id="pcards1"></div>
+        </div>
+
+        <!-- 右家 -->
+        <div class="player-area right" id="area3">
+            <div class="player-label">
+                <span class="pname" id="pname3"></span>
+                <span class="pcount" id="pcount3"></span>
+            </div>
+            <div class="player-cards back-cards vertical" id="pcards3"></div>
+        </div>
+
+        <!-- 中央出牌区 -->
+        <div class="play-zone">
+            <div id="playedCards" class="played-cards"></div>
+            <div id="actionLabel" class="action-label"></div>
+        </div>
+
+        <!-- 自己(下方) -->
+        <div class="player-area bottom" id="area0">
+            <div class="player-label">
+                <span class="pname" id="pname0"></span>
+                <span class="pcount" id="pcount0"></span>
+            </div>
+            <div class="my-hand" id="myHand"></div>
+            <div class="action-buttons" id="actionBtns">
+                <button id="btnPlay" class="btn btn-play" disabled>出牌</button>
+                <button id="btnPass" class="btn btn-pass" disabled>不出</button>
+            </div>
+        </div>
+
+        <!-- 叉/点询问弹窗 -->
+        <div id="chaDialog" class="dialog hidden">
+            <div class="dialog-content">
+                <p id="chaMsg"></p>
+                <button id="btnChaYes" class="btn btn-cha">叉！</button>
+                <button id="btnChaNo" class="btn btn-pass">不叉</button>
+            </div>
+        </div>
+        <div id="dianDialog" class="dialog hidden">
+            <div class="dialog-content">
+                <p id="dianMsg"></p>
+                <button id="btnDianYes" class="btn btn-dian">点！</button>
+                <button id="btnDianNo" class="btn btn-pass">不点</button>
+            </div>
+        </div>
+
+        <!-- 游戏日志 -->
+        <div class="game-log" id="gameLog"></div>
+    </div>
+
+    <!-- 结算弹窗 -->
+    <div id="resultDialog" class="dialog hidden">
+        <div class="dialog-content result-content">
+            <h2 id="resultTitle"></h2>
+            <div id="resultBody"></div>
+            <button id="btnNextRound" class="btn btn-primary">下一局</button>
+        </div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.4/socket.io.min.js"></script>
+    <script src="/js/logger.js"></script>
+    <script src="/js/ws.js"></script>
+    <script src="/js/game.js"></script>
+    <script src="/js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,189 @@
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+    font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
+    background: #1a5c2e;
+    color: #fff;
+    min-height: 100vh;
+    overflow: hidden;
+}
+.screen { display: none; width: 100vw; height: 100vh; position: absolute; top: 0; left: 0; }
+.screen.active { display: flex; }
+
+/* === 大厅 === */
+.lobby-container {
+    margin: auto; text-align: center;
+    background: rgba(0,0,0,0.5); padding: 60px 50px;
+    border-radius: 20px; min-width: 380px;
+}
+.title { font-size: 64px; font-weight: 900; color: #ffd700; text-shadow: 2px 2px 8px rgba(0,0,0,0.5); }
+.subtitle { font-size: 20px; color: #ccc; margin-bottom: 30px; }
+.lobby-form { display: flex; flex-direction: column; gap: 14px; }
+.lobby-form input {
+    padding: 12px 16px; border: 2px solid #444; border-radius: 10px;
+    background: rgba(255,255,255,0.1); color: #fff; font-size: 16px;
+    outline: none; transition: border-color .2s;
+}
+.lobby-form input:focus { border-color: #ffd700; }
+.btn {
+    padding: 12px 28px; border: none; border-radius: 10px;
+    font-size: 16px; font-weight: 600; cursor: pointer;
+    transition: all .15s; color: #fff;
+}
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-primary { background: linear-gradient(135deg, #e6a800, #cc8400); }
+.btn-primary:hover:not(:disabled) { transform: translateY(-2px); box-shadow: 0 4px 15px rgba(230,168,0,0.4); }
+.btn-play { background: linear-gradient(135deg, #27ae60, #1e8449); }
+.btn-play:hover:not(:disabled) { transform: translateY(-1px); }
+.btn-pass { background: linear-gradient(135deg, #7f8c8d, #5d6d7e); }
+.btn-pass:hover:not(:disabled) { transform: translateY(-1px); }
+.btn-cha { background: linear-gradient(135deg, #e74c3c, #c0392b); }
+.btn-dian { background: linear-gradient(135deg, #8e44ad, #6c3483); }
+.btn-restart { background: linear-gradient(135deg, #3498db, #21618c); padding: 6px 14px; font-size: 13px; margin-left: auto; }
+.btn-restart:hover:not(:disabled) { transform: translateY(-1px); }
+.msg { margin-top: 10px; color: #ff6b6b; min-height: 24px; }
+
+/* === 等待房间 === */
+.waiting-container {
+    margin: auto; text-align: center;
+    background: rgba(0,0,0,0.5); padding: 40px;
+    border-radius: 20px; min-width: 500px;
+}
+.waiting-container h2 { color: #ffd700; margin-bottom: 20px; }
+.seats-preview {
+    display: grid; grid-template-columns: 1fr 1fr;
+    gap: 16px; margin: 20px 0;
+}
+.seat-slot {
+    background: rgba(255,255,255,0.08); border-radius: 12px;
+    padding: 16px; border: 2px solid rgba(255,255,255,0.15);
+}
+.seat-slot.occupied { border-color: #ffd700; background: rgba(255,215,0,0.1); }
+.seat-slot.is-me { border-color: #27ae60; background: rgba(39,174,96,0.15); }
+.seat-label { font-size: 12px; color: #999; margin-bottom: 4px; }
+.seat-name { font-size: 18px; font-weight: 600; }
+.level-info { display: flex; gap: 24px; justify-content: center; margin: 16px 0; color: #ccc; }
+.level-info b { color: #ffd700; }
+.ai-options { display: flex; gap: 10px; justify-content: center; align-items: center; margin-top: 12px; color: #ccc; }
+.ai-options select { padding: 8px 12px; border-radius: 8px; border: 1px solid #666; background: rgba(0,0,0,0.35); color: #fff; }
+.waiting-actions { display: flex; gap: 12px; justify-content: center; margin-top: 18px; }
+
+/* === 游戏界面 === */
+#gameScreen { display: none; flex-direction: column; position: relative; }
+#gameScreen.active { display: flex; }
+.game-info-bar {
+    position: absolute; top: 0; left: 0; right: 0;
+    display: flex; gap: 24px; padding: 10px 20px;
+    background: rgba(0,0,0,0.5); font-size: 14px; z-index: 10;
+}
+.game-info-bar b { color: #ffd700; }
+
+/* 玩家区域 */
+.player-area { position: absolute; display: flex; flex-direction: column; align-items: center; }
+.player-area.top { top: 50px; left: 50%; transform: translateX(-50%); }
+.player-area.bottom { bottom: 10px; left: 50%; transform: translateX(-50%); width: 80%; }
+.player-area.left { left: 10px; top: 50%; transform: translateY(-50%); }
+.player-area.right { right: 10px; top: 50%; transform: translateY(-50%); }
+
+.player-label {
+    display: flex; gap: 8px; align-items: center;
+    padding: 4px 14px; border-radius: 20px;
+    background: rgba(0,0,0,0.4); margin-bottom: 6px; font-size: 13px;
+}
+.player-label.active { background: rgba(255,215,0,0.3); border: 1px solid #ffd700; }
+.player-label.finished { opacity: 0.5; }
+.pname { font-weight: 600; }
+.pcount { color: #ccc; font-size: 12px; }
+
+/* 背面牌 */
+.back-cards { display: flex; gap: -8px; }
+.card-back {
+    width: 36px; height: 52px; background: linear-gradient(135deg, #2c3e50, #34495e);
+    border: 2px solid #4a6a8a; border-radius: 5px;
+    margin-left: -12px; display: inline-block;
+}
+.card-back:first-child { margin-left: 0; }
+.vertical .card-back {
+    width: 52px; height: 36px; margin-left: 0; margin-top: -20px;
+}
+.vertical .card-back:first-child { margin-top: 0; }
+
+/* 中央出牌区 */
+.play-zone {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    display: flex; flex-direction: column; align-items: center;
+    min-width: 200px; min-height: 100px;
+}
+.played-cards { display: flex; gap: 4px; }
+.action-label {
+    margin-top: 8px; font-size: 15px; font-weight: 600;
+    padding: 4px 16px; border-radius: 12px;
+    background: rgba(0,0,0,0.5); min-height: 28px;
+}
+
+/* 手牌 */
+.my-hand {
+    display: flex; justify-content: center; gap: 2px;
+    flex-wrap: nowrap; margin-bottom: 8px;
+}
+.card {
+    width: 56px; height: 80px; border-radius: 6px;
+    background: #fff; color: #333; border: 2px solid #bbb;
+    display: flex; flex-direction: column; align-items: center;
+    justify-content: center; cursor: pointer;
+    transition: all .12s; user-select: none; font-size: 14px;
+    position: relative; flex-shrink: 0;
+}
+.card .card-suit { font-size: 18px; }
+.card .card-rank { font-size: 16px; font-weight: 700; }
+.card.red { color: #d32f2f; }
+.card.black { color: #222; }
+.card.joker-r { background: linear-gradient(135deg, #ff5252, #ff1744); color: #fff; }
+.card.joker-b { background: linear-gradient(135deg, #424242, #212121); color: #fff; }
+.card.selected { transform: translateY(-14px); border-color: #ffd700; box-shadow: 0 4px 12px rgba(255,215,0,0.5); }
+.card:hover { transform: translateY(-6px); }
+.card.selected:hover { transform: translateY(-14px); }
+
+/* 出牌区的牌（小号） */
+.played-cards .card {
+    width: 44px; height: 64px; font-size: 12px; cursor: default;
+}
+.played-cards .card .card-suit { font-size: 15px; }
+.played-cards .card .card-rank { font-size: 14px; }
+.played-cards .card:hover { transform: none; }
+
+/* 操作按钮 */
+.action-buttons {
+    display: flex; gap: 12px; justify-content: center; margin-top: 4px;
+}
+
+/* 弹窗 */
+.dialog {
+    position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0,0,0,0.6); display: flex;
+    align-items: center; justify-content: center; z-index: 100;
+}
+.dialog.hidden { display: none; }
+.dialog-content {
+    background: #2c3e50; padding: 30px 40px; border-radius: 16px;
+    text-align: center; min-width: 300px; border: 2px solid #ffd700;
+}
+.dialog-content p { margin-bottom: 20px; font-size: 18px; }
+.dialog-content .btn { margin: 0 8px; }
+.result-content h2 { color: #ffd700; margin-bottom: 16px; font-size: 24px; }
+.result-content #resultBody { margin-bottom: 20px; line-height: 1.8; }
+
+/* 游戏日志 */
+.game-log {
+    position: absolute; bottom: 140px; right: 10px;
+    width: 220px; max-height: 200px; overflow-y: auto;
+    background: rgba(0,0,0,0.5); border-radius: 10px;
+    padding: 8px 12px; font-size: 12px; line-height: 1.6;
+    color: #ccc;
+}
+.game-log .log-cha { color: #e74c3c; font-weight: 600; }
+.game-log .log-dian { color: #8e44ad; font-weight: 600; }
+.game-log .log-bomb { color: #f39c12; font-weight: 600; }
+
+/* 动画 */
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+.waiting-pulse { animation: pulse 1.5s infinite; }
