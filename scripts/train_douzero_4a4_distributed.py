@@ -21,7 +21,6 @@ ROOT = os.path.dirname(os.path.dirname(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from douzero_4a4.model import DouZero4A4Model
 from models.room import LEVEL_ORDER
 from rl.model import CardPolicyNetwork, torch
 from scripts.train_douzero_4a4 import (
@@ -31,6 +30,21 @@ from scripts.train_douzero_4a4 import (
     save_checkpoint,
     run_episode,
 )
+
+
+class DouZero4A4CardPolicyModel(torch.nn.Module):
+    """Four position-specific teacher models using the same backend architecture."""
+
+    def __init__(self):
+        super().__init__()
+        self.models = torch.nn.ModuleList(
+            [CardPolicyNetwork() for _ in range(4)])
+
+    def forward_for_seat(self, seat, state_vec, action_vecs, history_vecs):
+        return self.models[seat % 4](state_vec, action_vecs, history_vecs)
+
+    def forward(self, seat, state_vec, action_vecs, history_vecs):
+        return self.forward_for_seat(seat, state_vec, action_vecs, history_vecs)
 
 
 def _to_cpu_transition(item):
@@ -92,7 +106,7 @@ def actor_loop(actor_id, device_name, args_dict, weight_path, out_queue,
     if device_name.startswith('cuda') and not torch.cuda.is_available():
         device_name = 'cpu'
     device = torch.device(device_name)
-    model = DouZero4A4Model().to(device)
+    model = DouZero4A4CardPolicyModel().to(device)
     model.eval()
     last_mtime = None
     local_args = _actor_args(args)
@@ -145,23 +159,84 @@ def _fmt(value):
 
 
 def _log(metrics):
+    labels = {
+        'frames': '帧数',
+        'episodes': '回合数',
+        'fps': 'FPS',
+        'replay': '重放队列长度',
+        'queue': '交互队列长度',
+        'queue_timeouts': '队列超时次数',
+        'loss': '教师损失',
+        'abs_error': '教师平均绝对误差',
+        'backend_loss': '后端损失',
+        'backend_abs_error': '后端平均绝对误差',
+        'finish_rate': '完成率',
+        'full_hole_rate': '全洞率',
+        'half_hole_rate': '半洞率',
+        'stage_change_rate': '阶段变化率',
+        'invalid': '无效操作数',
+        'actor_errors': '演员错误数',
+        'avg_candidates': '平均候选动作数',
+        'avg_selected_q': '平均选中Q值',
+        'avg_greedy_q': '平均贪婪Q值',
+        'team0_reward_mean': '队伍0平均奖励',
+        'team1_reward_mean': '队伍1平均奖励',
+        'transitions': '决策数',
+        'plays': '出牌次数',
+        'passes': 'Pass次数',
+        'explore_actions': '探索动作数',
+        'cha_asks': '查问次数',
+        'cha_declines': '查拒绝次数',
+        'dian_asks': '点问次数',
+        'dian_declines': '点拒绝次数',
+        'q_mean': '教师平均Q值',
+        'grad_norm': '教师梯度范数',
+        'backend_q_mean': '后端平均Q值',
+        'backend_grad_norm': '后端梯度范数',
+        'teacher_eval_model_team_win_rate': '教师评估队伍胜率',
+        'backend_eval_model_team_win_rate': '后端评估队伍胜率',
+    }
     keys = [
-        'frames', 'episodes', 'fps', 'replay', 'queue',
-        'loss', 'abs_error', 'backend_loss', 'backend_abs_error',
+        'frames', 'episodes', 'fps', 'replay', 'queue', 'queue_timeouts',
+        'loss', 'abs_error', 'q_mean', 'grad_norm',
+        'backend_loss', 'backend_abs_error', 'backend_q_mean',
+        'backend_grad_norm',
         'finish_rate', 'full_hole_rate', 'half_hole_rate',
         'stage_change_rate', 'invalid', 'actor_errors',
-        'avg_candidates', 'cha_asks', 'cha_declines',
-        'dian_asks', 'dian_declines',
+        'avg_candidates', 'avg_selected_q', 'avg_greedy_q',
+        'team0_reward_mean', 'team1_reward_mean', 'transitions',
+        'plays', 'passes', 'explore_actions',
+        'cha_asks', 'cha_declines', 'dian_asks', 'dian_declines',
         'teacher_eval_model_team_win_rate',
         'backend_eval_model_team_win_rate',
     ]
-    print(' '.join('%s=%s' % (key, _fmt(metrics[key]))
+    print(' '.join('%s=%s' % (labels.get(key, key), _fmt(metrics[key]))
                    for key in keys if key in metrics), flush=True)
 
 
 def _checkpoint_path(base_path, frames):
     root, ext = os.path.splitext(base_path)
     return '%s_step_%d%s' % (root, frames, ext or '.pt')
+
+
+def _save_split_teacher_checkpoints(path, teacher, args, frames,
+                                   episodes, last_update):
+    if not hasattr(teacher, 'models'):
+        return
+    root, ext = os.path.splitext(path)
+    ext = ext or '.pt'
+    for seat_idx, seat_model in enumerate(teacher.models):
+        seat_path = '%s_seat%d%s' % (root, seat_idx, ext)
+        os.makedirs(os.path.dirname(seat_path) or '.', exist_ok=True)
+        torch.save({
+            'model_state_dict': seat_model.state_dict(),
+            'model_type': 'douzero_4a4_teacher_seat',
+            'teacher_model_class': 'rl.model.CardPolicyNetwork',
+            'global_step': frames,
+            'episode': episodes,
+            'args': vars(args),
+            'metrics': last_update,
+        }, seat_path)
 
 
 def _sample_replay(replay, count):
@@ -179,6 +254,19 @@ def _aggregate_rates(recent):
         'stage_change_rate': recent['stage_changes'] / episodes,
         'avg_candidates': (
             recent['avg_candidates_x1000'] / episodes / 1000.0),
+        'avg_selected_q': (
+            recent['avg_selected_q_x1000'] / episodes / 1000.0),
+        'avg_greedy_q': (
+            recent['avg_greedy_q_x1000'] / episodes / 1000.0),
+        'team0_reward_mean': (
+            recent['team0_reward_x1000'] / episodes / 1000.0),
+        'team1_reward_mean': (
+            recent['team1_reward_x1000'] / episodes / 1000.0),
+        'transitions': recent['transitions'],
+        'plays': recent['plays'],
+        'passes': recent['passes'],
+        'explore_actions': recent['explore_actions'],
+        'queue_timeouts': recent['queue_timeouts'],
     }
 
 
@@ -228,7 +316,7 @@ def main():
         args.device = 'cpu'
     learner_device = torch.device(args.device)
 
-    teacher = DouZero4A4Model().to(learner_device)
+    teacher = DouZero4A4CardPolicyModel().to(learner_device)
     backend = CardPolicyNetwork().to(learner_device)
     teacher_optimizer = torch.optim.RMSprop(
         teacher.parameters(), lr=args.lr, momentum=0.0, eps=1e-5,
@@ -354,13 +442,17 @@ def main():
                 save_checkpoint(
                     teacher, backend, teacher_optimizer, backend_optimizer,
                     path, frames, episodes, args, last_update)
-                print('checkpoint_saved=%s' % path, flush=True)
+                _save_split_teacher_checkpoints(
+                    path, teacher, args, frames, episodes, last_update)
+                print('已保存检查点=%s' % path, flush=True)
                 next_checkpoint += args.checkpoint_every
 
         save_checkpoint(
             teacher, backend, teacher_optimizer, backend_optimizer,
             args.save, frames, episodes, args, last_update)
-        print('final_checkpoint=%s frames=%d episodes=%d' % (
+        _save_split_teacher_checkpoints(
+            args.save, teacher, args, frames, episodes, last_update)
+        print('最终检查点=%s 帧数=%d 回合数=%d' % (
             args.save, frames, episodes), flush=True)
     finally:
         stop_event.set()

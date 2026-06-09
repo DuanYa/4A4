@@ -23,11 +23,52 @@ except ImportError:  # 允许未安装torch时仍能启动普通规则AI
 STATE_DIM = 224
 ACTION_DIM = 64
 HISTORY_DIM = 96
-HISTORY_LEN = 40
+HISTORY_LEN = 100
 HIDDEN_DIM = 512
 
 
 if nn is not None:
+    class RoPETransformerEncoderLayer(nn.TransformerEncoderLayer):
+        def __init__(self, *args, **kwargs):
+            self.d_model = kwargs.get('d_model', None)
+            super().__init__(*args, **kwargs)
+            if self.d_model is None:
+                self.d_model = self.embed_dim
+            inv_freq = 1.0 / (
+                10000 ** (torch.arange(0, self.d_model, 2, dtype=torch.float32)
+                           / self.d_model)
+            )
+            self.register_buffer('rope_inv_freq', inv_freq)
+
+        @staticmethod
+        def _rotate_half(x):
+            x1 = x[..., ::2]
+            x2 = x[..., 1::2]
+            return torch.stack((-x2, x1), dim=-1).flatten(-2)
+
+        def _apply_rope(self, x):
+            seq_len = x.size(1)
+            pos = torch.arange(seq_len, dtype=x.dtype, device=x.device)
+            freqs = torch.einsum('n,d->nd', pos, self.rope_inv_freq)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos().unsqueeze(0)
+            sin = emb.sin().unsqueeze(0)
+            return x * cos + self._rotate_half(x) * sin
+
+        def _sa_block(self, x, attn_mask, key_padding_mask, is_causal=False):
+            roped = self._apply_rope(x)
+            x = self.self_attn(
+                roped,
+                roped,
+                x,
+                attn_mask=attn_mask,
+                key_padding_mask=key_padding_mask,
+                need_weights=False,
+                is_causal=is_causal,
+            )[0]
+            return self.dropout1(x)
+
+
     class CardPolicyNetwork(nn.Module):
         """兼容旧名称的历史感知Actor-Critic网络"""
 
@@ -44,7 +85,7 @@ if nn is not None:
                 nn.ReLU(),
             )
             self.history_proj = nn.Linear(history_dim, hidden_dim)
-            encoder_layer = nn.TransformerEncoderLayer(
+            encoder_layer = RoPETransformerEncoderLayer(
                 d_model=hidden_dim,
                 nhead=4,
                 dim_feedforward=hidden_dim * 2,
@@ -82,7 +123,9 @@ if nn is not None:
                     dtype=state_vec.dtype, device=state_vec.device)
             elif history_vecs.dim() == 2:
                 history_vecs = history_vecs.unsqueeze(0)
-            return state_vec, action_vecs, history_vecs
+
+            history_mask = (history_vecs.abs().sum(dim=-1) == 0)
+            return state_vec, action_vecs, history_vecs, history_mask
 
         def forward(self, state_vec, action_vecs, history_vecs=None):
             """返回每个合法动作的logit，兼容旧推理接口"""
@@ -93,13 +136,14 @@ if nn is not None:
         def forward_actor_critic(self, state_vec, action_vecs,
                                  history_vecs=None):
             """同时输出动作logits和状态价值"""
-            state_vec, action_vecs, history_vecs = self._normalize_inputs(
+            state_vec, action_vecs, history_vecs, history_mask = self._normalize_inputs(
                 state_vec, action_vecs, history_vecs)
             batch, action_count, _ = action_vecs.shape
 
             state_emb = self.state_encoder(state_vec)
             hist_tokens = self.history_proj(history_vecs)
-            hist_encoded = self.history_encoder(hist_tokens)
+            hist_encoded = self.history_encoder(
+                hist_tokens, src_key_padding_mask=history_mask)
             hist_emb = hist_encoded.mean(dim=1)
             action_emb = self.action_encoder(action_vecs)
 

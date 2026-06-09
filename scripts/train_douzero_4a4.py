@@ -332,8 +332,12 @@ def save_checkpoint(douzero_model, backend_model, douzero_optimizer,
         'global_step': frames,
         'episode': episodes,
         'model_type': 'douzero_4a4_dmc_backend_compatible',
-        'teacher_model_class': 'douzero_4a4.model.DouZero4A4Model',
-        'backend_model_class': 'rl.model.CardPolicyNetwork',
+        'teacher_model_class': (
+            douzero_model.__class__.__module__ + '.' +
+            douzero_model.__class__.__name__),
+        'backend_model_class': (
+            backend_model.__class__.__module__ + '.' +
+            backend_model.__class__.__name__),
         'reward_version': 'terminal_team_utility_v1',
         'args': vars(args),
         'metrics': metrics,
