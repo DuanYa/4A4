@@ -12,6 +12,7 @@ import os
 import random
 import sys
 import time
+import warnings
 from collections import Counter, deque
 from multiprocessing import Event, Process, Queue, set_start_method
 from queue import Empty
@@ -306,6 +307,10 @@ def main():
 
     if torch is None:
         raise RuntimeError('distributed training requires torch')
+    warnings.filterwarnings(
+        'ignore',
+        message='The PyTorch API of nested tensors is in prototype stage and will change in the near future.*'
+    )
     if args.torch_threads > 0:
         torch.set_num_threads(args.torch_threads)
     if args.seed >= 0:
@@ -315,6 +320,8 @@ def main():
     if args.device.startswith('cuda') and not torch.cuda.is_available():
         args.device = 'cpu'
     learner_device = torch.device(args.device)
+    print('开始分布式训练：learner=%s actor_devices=%s log_every=%d' % (
+        args.device, args.actor_devices, args.log_every), flush=True)
 
     teacher = DouZero4A4CardPolicyModel().to(learner_device)
     backend = CardPolicyNetwork().to(learner_device)
