@@ -1,0 +1,3 @@
+checkpoints/douzero_4a4_distributed_100x_step_40000000.pt
+checkpoints/douzero_4a4_final_gpu0.pt
+data/4a4.sqlite3

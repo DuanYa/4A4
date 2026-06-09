@@ -6,6 +6,7 @@ import threading
 import time
 import logging
 from models.game import GamePhase
+from models import storage
 from flask_socketio import SocketIO, emit, join_room, leave_room
 from flask import request
 
@@ -29,7 +30,7 @@ ERR_MSG = {
     'invalid_index': '无效的牌索引',
     'invalid_hand': '不是合法的牌型',
     'no_double_straight_lead': '首家不可出双龙',
-    'cannot_beat': '出的牌管不住上家',
+    'cannot_beat': '管不上，请换牌或选择不出',
     'not_cha_phase': '当前不是叉牌询问阶段',
     'not_dian_phase': '当前不是点牌询问阶段',
     'not_asked': '没有询问你',
@@ -72,7 +73,38 @@ def broadcast_state(room_id):
 def broadcast_action(room_id, action_data):
     logger.info('broadcast_action: room_id=%s action=%s data=%s',
                 room_id, action_data.get('action'), action_data)
+    storage.log_event(
+        room_id,
+        action_data.get('action') or 'game_action',
+        action_data,
+        seat=action_data.get('seat'))
     socketio.emit('game_action', action_data, to=room_id)
+
+
+def _auth_from_data(data):
+    user = storage.validate_session(data.get('session_token', ''))
+    return user
+
+
+def _snapshot(room, round_result=None):
+    try:
+        storage.save_room_snapshot(room, round_result=round_result)
+    except Exception:
+        logger.exception('save_room_snapshot failed: room_id=%s',
+                         getattr(room, 'room_id', None))
+
+
+def _persist_room_members(room):
+    if room is None:
+        return
+    for p in room.players:
+        user_id = getattr(p, 'user_id', None) if p is not None else None
+        if not user_id:
+            continue
+        storage.upsert_room_member(
+            room.room_id, user_id, p.seat, p.name,
+            _is_host(room, p.player_id), p.player_id,
+            status='online' if getattr(p, 'online', True) else 'offline')
 
 
 def _next_ai_name(room):
@@ -146,29 +178,40 @@ def register_events(sio):
                         sid, rid, info['seat'])
             room = room_manager.get(rid)
             if room:
-                room.remove_player(sid)
+                if info.get('user_id'):
+                    room.mark_offline(sid)
+                    storage.mark_member_offline(rid, info['user_id'], socket_sid=sid)
+                else:
+                    room.remove_player(sid)
                 leave_room(rid, sid=sid)
                 sio.emit('player_left', {
                     'seat': info['seat'],
+                    'offline': bool(info.get('user_id')),
                 }, to=rid)
                 sio.emit('room_state',
                          room.get_room_state(), to=rid)
+                _snapshot(room)
 
     @sio.on('join_room')
     def on_join_room(data):
         sid = request.sid
         rid = data.get('room_id', '')
         name = data.get('name', 'Player')
+        user = _auth_from_data(data)
+        user_id = user['user_id'] if user else None
+        avatar_url = data.get('avatar_url') or (user or {}).get('avatar_url') or ''
         logger.info('WS join_room request: sid=%s room_id=%s name=%s', sid, rid, name)
         if rid not in room_manager:
             emit('error', {'message': '房间不存在'})
             return
         room = room_manager[rid]
-        if room.is_full():
+        if room.is_full() and not room.has_user(user_id):
             emit('error', {'message': '房间已满'})
             return
         is_ai = bool(data.get('is_ai', False))
-        seat = room.add_player(sid, name, is_ai=is_ai)
+        seat = room.add_player(
+            sid, name, is_ai=is_ai, user_id=user_id,
+            avatar_url=avatar_url)
         if data.get('is_host') and not is_ai:
             room.host_player_id = sid
         if seat < 0:
@@ -176,13 +219,57 @@ def register_events(sio):
             return
         with session_lock:
             player_sessions[sid] = {
-                'room_id': rid, 'seat': seat}
+                'room_id': rid, 'seat': seat, 'user_id': user_id}
         join_room(rid)
+        if user_id:
+            storage.upsert_room_member(
+                rid, user_id, seat, name, _is_host(room, sid), sid)
         logger.info('WS join_room success: sid=%s room_id=%s seat=%s name=%s',
                     sid, rid, seat, name)
         room_state = room.get_room_state()
         emit('joined', {'seat': seat, 'room_id': rid, 'room_state': room_state})
         sio.emit('room_state', room_state, to=rid)
+        if room.current_game is not None:
+            emit('game_state', room.current_game.get_state(for_seat=seat))
+        _snapshot(room)
+
+    @sio.on('update_profile')
+    def on_update_profile(data):
+        sid = request.sid
+        with session_lock:
+            info = player_sessions.get(sid)
+        user = _auth_from_data(data)
+        if not info or not user:
+            emit('error', {'message': 'invalid_session'})
+            return
+        rid = info['room_id']
+        room = room_manager.get(rid)
+        if not room:
+            return
+        name = data.get('name') or data.get('nickname') or ''
+        avatar_url = data.get('avatar_url') or ''
+        player = room.get_player_by_id(sid)
+        if player is not None:
+            if name:
+                player.name = name
+            if avatar_url:
+                player.avatar_url = avatar_url
+        storage.update_user_profile(
+            user['user_id'], nickname=name, avatar_url=avatar_url)
+        if player is not None:
+            storage.upsert_room_member(
+                rid, user['user_id'], player.seat, player.name,
+                _is_host(room, sid), sid)
+        room_state = room.get_room_state()
+        emit('profile_updated', {
+            'name': name,
+            'avatar_url': avatar_url,
+            'room_state': room_state,
+        })
+        sio.emit('room_state', room_state, to=rid)
+        if room.current_game is not None:
+            broadcast_state(rid)
+        _snapshot(room)
 
     @sio.on('start_game')
     def on_start_game(data):
@@ -270,6 +357,8 @@ def register_events(sio):
             logger.info('WS add_ai success: room_id=%s model=%s count=%s',
                         rid, ai_model, room.player_count)
             socketio.emit('room_state', room.get_room_state(), to=rid)
+            _persist_room_members(room)
+            _snapshot(room)
 
         threading.Thread(target=add_ai_task, daemon=True).start()
 
@@ -309,6 +398,8 @@ def register_events(sio):
             if p is not None and p.player_id in player_sessions:
                 socketio.emit('seat_changed', {'seat': p.seat, 'room_id': rid}, to=p.player_id)
         socketio.emit('room_state', room.get_room_state(), to=rid)
+        _persist_room_members(room)
+        _snapshot(room)
 
     @sio.on('play_cards')
     def on_play_cards(data):
@@ -329,7 +420,8 @@ def register_events(sio):
             logger.info('WS play_cards failed: room_id=%s seat=%s message=%s',
                         info['room_id'], info['seat'], result['message'])
             emit('error',
-                 {'message': get_msg(result['message'])})
+                 {'message': get_msg(result['message']),
+                  'code': result['message']})
             return
         broadcast_action(info['room_id'], result)
         _handle_post_play(info['room_id'], room, result)
@@ -356,6 +448,7 @@ def register_events(sio):
             return
         broadcast_action(info['room_id'], result)
         broadcast_state(info['room_id'])
+        _snapshot(room)
 
     @sio.on('respond_cha')
     def on_respond_cha(data):
@@ -410,12 +503,14 @@ def _do_start_game(room_id, room, restart=False):
         socketio.emit('error', {'message': '无法开始下一局，请确认房间仍有4名玩家'}, to=room_id)
         return
     socketio.emit('room_state', room.get_room_state(), to=room_id)
+    _persist_room_members(room)
     broadcast_action(room_id, {
         'action': 'game_started',
         'restart': restart,
         'level_rank': room.get_current_level(),
     })
     broadcast_state(room_id)
+    _snapshot(room)
 
 
 def _handle_post_play(room_id, room, result):
@@ -424,4 +519,6 @@ def _handle_post_play(room_id, room, result):
         if rr is not None:
             socketio.emit('room_state', room.get_room_state(), to=room_id)
             socketio.emit('round_end', rr, to=room_id)
+            _snapshot(room, round_result=rr)
     broadcast_state(room_id)
+    _snapshot(room)

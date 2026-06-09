@@ -26,18 +26,49 @@ class Room:
         self.round_history = []
         self.host_player_id = None
 
-    def add_player(self, player_id, name, is_ai=False):
+    def add_player(self, player_id, name, is_ai=False, user_id=None,
+                   avatar_url=''):
         """添加玩家到房间，返回座位号或-1"""
         with self.lock:
+            if user_id is not None:
+                for p in self.players:
+                    if p is not None and getattr(p, 'user_id', None) == user_id:
+                        old_player_id = p.player_id
+                        p.player_id = player_id
+                        p.name = name or p.name
+                        p.avatar_url = avatar_url or getattr(p, 'avatar_url', '')
+                        p.online = True
+                        if self.host_player_id == old_player_id:
+                            self.host_player_id = player_id
+                        return p.seat
             for i in range(4):
                 if self.players[i] is None:
-                    player = Player(player_id, name, i)
+                    player = Player(
+                        player_id, name, i, user_id=user_id,
+                        avatar_url=avatar_url)
                     player.is_ai = is_ai
+                    player.online = True
                     self.players[i] = player
                     if self.host_player_id is None and not is_ai:
                         self.host_player_id = player_id
                     self.player_count += 1
                     return i
+            return -1
+
+    def has_user(self, user_id):
+        if user_id is None:
+            return False
+        for p in self.players:
+            if p is not None and getattr(p, 'user_id', None) == user_id:
+                return True
+        return False
+
+    def mark_offline(self, player_id):
+        with self.lock:
+            for p in self.players:
+                if p is not None and p.player_id == player_id:
+                    p.online = False
+                    return p.seat
             return -1
 
     def remove_player(self, player_id):
@@ -132,7 +163,7 @@ class Room:
                 upgrade = 2
             elif tr == 'ban_dong':
                 winner_team = team
-                upgrade = 1
+                upgrade = 0
 
         result['winner_team'] = winner_team
         result['upgrade'] = 0
@@ -185,6 +216,9 @@ class Room:
                     'seat': p.seat, 'name': p.name,
                     'player_id': p.player_id, 'team': p.team,
                     'is_ai': getattr(p, 'is_ai', False),
+                    'user_id': getattr(p, 'user_id', None),
+                    'avatar_url': getattr(p, 'avatar_url', ''),
+                    'online': getattr(p, 'online', True),
                 })
             else:
                 players_data.append(None)

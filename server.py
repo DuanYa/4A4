@@ -7,6 +7,7 @@ from flask_socketio import SocketIO
 import logging
 from routes.api import api_bp, init_api
 from routes.ws import init_ws
+from models.storage import init_db
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,6 +22,7 @@ socketio = SocketIO(app, async_mode='threading', cors_allowed_origins='*')
 
 room_manager = {}
 
+init_db()
 init_api(room_manager)
 init_ws(socketio, room_manager)
 app.register_blueprint(api_bp)

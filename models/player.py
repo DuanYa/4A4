@@ -7,15 +7,19 @@ from models.card import Card, sort_cards
 class Player:
     """玩家"""
 
-    def __init__(self, player_id: str, name: str, seat: int):
+    def __init__(self, player_id: str, name: str, seat: int, user_id=None,
+                 avatar_url=''):
         """
         player_id: 唯一标识（对应websocket的sid）
         name: 显示名称
         seat: 座位号 0-3
         """
         self.player_id = player_id
+        self.user_id = user_id
         self.name = name
+        self.avatar_url = avatar_url
         self.seat = seat
+        self.online = True
         self.hand = []          # 手牌列表
         self.finished = False   # 是否已出完牌
         self.finish_order = -1  # 出完牌的顺序(0=第一个出完)
@@ -69,9 +73,12 @@ class Player:
     def to_dict(self, hide_hand: bool = False) -> dict:
         return {
             'player_id': self.player_id,
+            'user_id': self.user_id,
             'name': self.name,
+            'avatar_url': self.avatar_url,
             'seat': self.seat,
             'team': self.team,
+            'online': self.online,
             'hand_size': self.hand_size(),
             'hand': [] if hide_hand else [c.to_dict() for c in self.hand],
             'finished': self.finished,
