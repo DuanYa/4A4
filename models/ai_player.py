@@ -188,7 +188,7 @@ class AIPlayer:
         try:
             if self.connected:
                 self.sio.emit('respond_cha', {
-                    'do_cha': self._should_cha()})
+                    'do_cha': self._choose_cha_with_model()})
         except Exception:
             import traceback; traceback.print_exc()
 
@@ -196,7 +196,7 @@ class AIPlayer:
         try:
             if self.connected:
                 self.sio.emit('respond_dian', {
-                    'do_dian': self._should_dian()})
+                    'do_dian': self._choose_dian_with_model()})
         except Exception:
             import traceback; traceback.print_exc()
 
@@ -231,6 +231,32 @@ class AIPlayer:
         if self._same_team(cha_player) and self._player_hand_size(cha_player) <= 2:
             return False
         return True
+
+    def _ensure_policy(self):
+        if self.policy is None:
+            from rl.policy import NeuralPolicy
+            self.policy = NeuralPolicy(self.model_name)
+        return self.policy
+
+    def _choose_cha_with_model(self):
+        if self.model_name in ('rule', 'heuristic', ''):
+            return self._should_cha()
+        try:
+            return self._ensure_policy().choose_cha(
+                self.game_state, self.hand, self.level_rank, self.seat,
+                self._should_cha)
+        except Exception:
+            return self._should_cha()
+
+    def _choose_dian_with_model(self):
+        if self.model_name in ('rule', 'heuristic', ''):
+            return self._should_dian()
+        try:
+            return self._ensure_policy().choose_dian(
+                self.game_state, self.hand, self.level_rank, self.seat,
+                self._should_dian)
+        except Exception:
+            return self._should_dian()
 
 
 # Mixin: inject search methods from ai_search

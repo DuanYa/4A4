@@ -1,10 +1,10 @@
 """Distributed actor-learner trainer for DouZero-4A4.
 
 This script keeps one shared learner/replay buffer and runs many independent
-actor processes. Actors refresh the latest teacher weights, collect complete
-4A4 episodes, and push CPU transitions into a multiprocessing queue. The learner
-trains one teacher model and one backend-compatible student model from the
-shared replay buffer.
+actor processes. Actors refresh the latest shared Transformer weights, collect
+complete 4A4 episodes, and push CPU transitions into a multiprocessing queue.
+The learner trains the same backend-compatible CardPolicyNetwork that will be
+served online.
 """
 import argparse
 import json
@@ -21,7 +21,6 @@ ROOT = os.path.dirname(os.path.dirname(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from douzero_4a4.model import DouZero4A4Model
 from models.room import LEVEL_ORDER
 from rl.model import CardPolicyNetwork, torch
 from scripts.train_douzero_4a4 import (
@@ -30,29 +29,52 @@ from scripts.train_douzero_4a4 import (
     evaluate,
     save_checkpoint,
     run_episode,
+    write_eval_records,
 )
 
 
-def _to_cpu_transition(item):
+def _pack_cpu_transitions(transitions):
+    if not transitions:
+        return None
+    max_actions = max(item.action_vecs.shape[0] for item in transitions)
+    action_dim = transitions[0].action_vecs.shape[-1]
+    actions = torch.zeros(
+        len(transitions), max_actions, action_dim, dtype=torch.float32)
+    action_counts = []
+    for row, item in enumerate(transitions):
+        count = item.action_vecs.shape[0]
+        actions[row, :count] = item.action_vecs.detach().cpu()
+        action_counts.append(count)
     return {
-        'state_vec': item.state_vec.detach().cpu().tolist(),
-        'history_vec': item.history_vec.detach().cpu().tolist(),
-        'action_vecs': item.action_vecs.detach().cpu().tolist(),
-        'action_index': item.action_index,
-        'seat': item.seat,
-        'reward': item.reward,
+        'state_vecs': torch.stack(
+            [item.state_vec.detach().cpu() for item in transitions]).numpy(),
+        'history_vecs': torch.stack(
+            [item.history_vec.detach().cpu() for item in transitions]).numpy(),
+        'action_vecs': actions.numpy(),
+        'action_counts': action_counts,
+        'action_indices': [item.action_index for item in transitions],
+        'seats': [item.seat for item in transitions],
+        'rewards': [item.reward for item in transitions],
     }
 
 
-def _from_packed_transition(item):
-    return Decision(
-        state_vec=torch.tensor(item['state_vec'], dtype=torch.float32),
-        history_vec=torch.tensor(item['history_vec'], dtype=torch.float32),
-        action_vecs=torch.tensor(item['action_vecs'], dtype=torch.float32),
-        action_index=item['action_index'],
-        seat=item['seat'],
-        reward=item['reward'],
-    )
+def _from_packed_transitions(items):
+    if not items:
+        return []
+    state_vecs = torch.from_numpy(items['state_vecs']).float()
+    history_vecs = torch.from_numpy(items['history_vecs']).float()
+    action_vecs = torch.from_numpy(items['action_vecs']).float()
+    decisions = []
+    for row, count in enumerate(items['action_counts']):
+        decisions.append(Decision(
+            state_vec=state_vecs[row],
+            history_vec=history_vecs[row],
+            action_vecs=action_vecs[row, :count],
+            action_index=items['action_indices'][row],
+            seat=items['seats'][row],
+            reward=items['rewards'][row],
+        ))
+    return decisions
 
 
 def _actor_args(args):
@@ -64,7 +86,7 @@ def _actor_args(args):
     return SimpleNamespace(**data)
 
 
-def _safe_load_teacher(model, path, device, last_mtime):
+def _safe_load_model(model, path, device, last_mtime):
     try:
         mtime = os.path.getmtime(path)
     except OSError:
@@ -73,7 +95,7 @@ def _safe_load_teacher(model, path, device, last_mtime):
         return last_mtime
     try:
         payload = torch.load(path, map_location=device)
-        state = payload.get('douzero_model_state_dict', payload)
+        state = payload.get('model_state_dict', payload)
         model.load_state_dict(state)
         model.eval()
         return mtime
@@ -92,21 +114,21 @@ def actor_loop(actor_id, device_name, args_dict, weight_path, out_queue,
     if device_name.startswith('cuda') and not torch.cuda.is_available():
         device_name = 'cpu'
     device = torch.device(device_name)
-    model = DouZero4A4Model().to(device)
+    model = CardPolicyNetwork().to(device)
     model.eval()
     last_mtime = None
     local_args = _actor_args(args)
     episodes = 0
 
     while not stop_event.is_set():
-        last_mtime = _safe_load_teacher(
+        last_mtime = _safe_load_model(
             model, weight_path, device, last_mtime)
         try:
             with torch.no_grad():
                 transitions, stats = run_episode(
                     model, local_args, device, train=True)
-            cpu_transitions = [_to_cpu_transition(t) for t in transitions]
-            out_queue.put((actor_id, cpu_transitions, dict(stats)))
+            out_queue.put((
+                actor_id, _pack_cpu_transitions(transitions), dict(stats)))
             episodes += 1
             if episodes % max(1, args.actor_refresh_episodes) == 0:
                 last_mtime = None
@@ -121,10 +143,10 @@ def actor_loop(actor_id, device_name, args_dict, weight_path, out_queue,
             time.sleep(1.0)
 
 
-def _publish_teacher(model, path):
+def _publish_model(model, path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + '.tmp'
-    torch.save({'douzero_model_state_dict': model.state_dict()}, tmp)
+    torch.save({'model_state_dict': model.state_dict()}, tmp)
     os.replace(tmp, path)
 
 
@@ -132,8 +154,9 @@ def _write_jsonl(path, metrics):
     if not path:
         return
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    cn_metrics = {CN_KEYS.get(key, key): value for key, value in metrics.items()}
     with open(path, 'a', encoding='utf-8') as f:
-        f.write(json.dumps(metrics, ensure_ascii=False, sort_keys=True) + '\n')
+        f.write(json.dumps(cn_metrics, ensure_ascii=False, sort_keys=True) + '\n')
 
 
 def _fmt(value):
@@ -144,18 +167,82 @@ def _fmt(value):
     return str(value)
 
 
+CN_KEYS = {
+    'frames': '样本步数',
+    'episodes': '局数',
+    'fps': '每秒样本',
+    'replay': '回放池样本',
+    'queue': '采样队列',
+    'loss': '训练损失',
+    'abs_error': '平均绝对误差',
+    'q_mean': '平均Q值',
+    'grad_norm': '梯度范数',
+    'update_ms': '更新耗时毫秒',
+    'update_batches_done': '更新批次数',
+    'update_samples': '更新样本数',
+    'finish_rate': '正常结束率',
+    'full_hole_rate': '全洞率',
+    'half_hole_rate': '半洞率',
+    'stage_change_rate': '台上切换率',
+    'team0_win_rate': '0队胜率',
+    'team1_win_rate': '1队胜率',
+    'team0_full_hole_rate': '0队全洞率',
+    'team0_half_hole_rate': '0队半洞率',
+    'team1_full_hole_rate': '1队全洞率',
+    'team1_half_hole_rate': '1队半洞率',
+    'invalid': '非法动作数',
+    'actor_errors': '采样进程错误数',
+    'queue_timeouts': '采样队列超时数',
+    'avg_candidates': '平均候选动作数',
+    'avg_selected_q': '平均所选Q值',
+    'avg_greedy_q': '平均贪心Q值',
+    'avg_q_gap': '平均探索Q差',
+    'plays': '出牌次数',
+    'passes': '过牌次数',
+    'pass_rate': '过牌率',
+    'explore_actions': '探索动作数',
+    'explore_rate': '探索动作率',
+    'cha_asks': '叉牌询问数',
+    'cha_declines': '不叉次数',
+    'cha_decline_rate': '不叉率',
+    'dian_asks': '点牌询问数',
+    'dian_declines': '不点次数',
+    'dian_decline_rate': '不点率',
+    'eval_model_team_win_rate': '评估胜率',
+    'eval_model_team_full_hole_rate': '评估模型队全洞率',
+    'eval_model_team_half_hole_rate': '评估模型队半洞率',
+    'eval_rule_team_win_rate': '评估规则队胜率',
+    'eval_rule_team_full_hole_rate': '评估规则队全洞率',
+    'eval_rule_team_half_hole_rate': '评估规则队半洞率',
+    'eval_full_hole_rate': '评估全洞率',
+    'eval_half_hole_rate': '评估半洞率',
+    'eval_truncated_rate': '评估截断率',
+    'eval_invalid': '评估非法动作数',
+}
+
+
 def _log(metrics):
     keys = [
         'frames', 'episodes', 'fps', 'replay', 'queue',
-        'loss', 'abs_error', 'backend_loss', 'backend_abs_error',
+        'loss', 'abs_error', 'q_mean', 'grad_norm',
+        'update_ms', 'update_batches_done', 'update_samples',
         'finish_rate', 'full_hole_rate', 'half_hole_rate',
-        'stage_change_rate', 'invalid', 'actor_errors',
-        'avg_candidates', 'cha_asks', 'cha_declines',
-        'dian_asks', 'dian_declines',
-        'teacher_eval_model_team_win_rate',
-        'backend_eval_model_team_win_rate',
+        'stage_change_rate',
+        'team0_win_rate', 'team1_win_rate',
+        'team0_full_hole_rate', 'team0_half_hole_rate',
+        'team1_full_hole_rate', 'team1_half_hole_rate',
+        'invalid', 'actor_errors', 'queue_timeouts',
+        'avg_candidates', 'avg_selected_q', 'avg_greedy_q', 'avg_q_gap',
+        'plays', 'passes', 'pass_rate', 'explore_actions', 'explore_rate',
+        'cha_asks', 'cha_declines', 'cha_decline_rate',
+        'dian_asks', 'dian_declines', 'dian_decline_rate',
+        'eval_model_team_win_rate', 'eval_model_team_full_hole_rate',
+        'eval_model_team_half_hole_rate', 'eval_rule_team_win_rate',
+        'eval_rule_team_full_hole_rate', 'eval_rule_team_half_hole_rate',
+        'eval_full_hole_rate', 'eval_half_hole_rate',
+        'eval_truncated_rate', 'eval_invalid',
     ]
-    print(' '.join('%s=%s' % (key, _fmt(metrics[key]))
+    print(' '.join('%s=%s' % (CN_KEYS.get(key, key), _fmt(metrics[key]))
                    for key in keys if key in metrics), flush=True)
 
 
@@ -177,8 +264,18 @@ def _aggregate_rates(recent):
         'full_hole_rate': recent['result_quan_dong'] / episodes,
         'half_hole_rate': recent['result_ban_dong'] / episodes,
         'stage_change_rate': recent['stage_changes'] / episodes,
+        'team0_win_rate': recent['team0_wins'] / episodes,
+        'team1_win_rate': recent['team1_wins'] / episodes,
+        'team0_full_hole_rate': recent['team0_quan_dong'] / episodes,
+        'team0_half_hole_rate': recent['team0_ban_dong'] / episodes,
+        'team1_full_hole_rate': recent['team1_quan_dong'] / episodes,
+        'team1_half_hole_rate': recent['team1_ban_dong'] / episodes,
         'avg_candidates': (
             recent['avg_candidates_x1000'] / episodes / 1000.0),
+        'avg_selected_q': (
+            recent['avg_selected_q_x1000'] / episodes / 1000.0),
+        'avg_greedy_q': (
+            recent['avg_greedy_q_x1000'] / episodes / 1000.0),
     }
 
 
@@ -190,7 +287,6 @@ def main():
     parser.add_argument('--actors-per-device', type=int, default=4)
     parser.add_argument('--seed', type=int, default=20260606)
     parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--backend-lr', type=float, default=1e-4)
     parser.add_argument('--batch-size', type=int, default=512)
     parser.add_argument('--replay-size', type=int, default=60000)
     parser.add_argument('--min-replay', type=int, default=8192)
@@ -207,6 +303,9 @@ def main():
     parser.add_argument('--checkpoint-every', type=int, default=1000000)
     parser.add_argument('--eval-every', type=int, default=5000000)
     parser.add_argument('--eval-episodes', type=int, default=256)
+    parser.add_argument('--eval-record-episodes', type=int, default=4)
+    parser.add_argument('--eval-record-jsonl', default=os.path.join(
+        ROOT, 'logs', 'douzero_4a4_distributed_eval_records.jsonl'))
     parser.add_argument('--log-every', type=int, default=100000)
     parser.add_argument('--log-jsonl', default=os.path.join(
         ROOT, 'logs', 'douzero_4a4_distributed_100x_metrics.jsonl'))
@@ -228,19 +327,15 @@ def main():
         args.device = 'cpu'
     learner_device = torch.device(args.device)
 
-    teacher = DouZero4A4Model().to(learner_device)
-    backend = CardPolicyNetwork().to(learner_device)
-    teacher_optimizer = torch.optim.RMSprop(
-        teacher.parameters(), lr=args.lr, momentum=0.0, eps=1e-5,
-        alpha=0.99)
-    backend_optimizer = torch.optim.RMSprop(
-        backend.parameters(), lr=args.backend_lr, momentum=0.0, eps=1e-5,
+    model = CardPolicyNetwork().to(learner_device)
+    optimizer = torch.optim.RMSprop(
+        model.parameters(), lr=args.lr, momentum=0.0, eps=1e-5,
         alpha=0.99)
 
     run_dir = os.path.join(ROOT, 'runtime', 'douzero_4a4_distributed')
     os.makedirs(run_dir, exist_ok=True)
-    weight_path = os.path.join(run_dir, 'latest_teacher.pt')
-    _publish_teacher(teacher, weight_path)
+    weight_path = os.path.join(run_dir, 'latest_model.pt')
+    _publish_model(model, weight_path)
 
     replay = deque(maxlen=args.replay_size)
     queue = Queue(maxsize=args.queue_size)
@@ -286,7 +381,7 @@ def main():
             recent.update(stats)
             recent['episodes'] += 1
             episodes += 1
-            transitions = [_from_packed_transition(t) for t in transitions]
+            transitions = _from_packed_transitions(transitions)
             replay.extend(transitions)
             frames += len(transitions)
             since_update += len(transitions)
@@ -294,17 +389,16 @@ def main():
             if len(replay) >= args.min_replay and since_update >= args.update_frames:
                 sample_count = args.batch_size * args.update_batches
                 batch = _sample_replay(replay, sample_count)
-                teacher_update = dmc_update(
-                    teacher, teacher_optimizer, batch, args, learner_device)
-                backend_update = dmc_update(
-                    backend, backend_optimizer, batch, args, learner_device)
-                last_update = dict(teacher_update)
-                for key, value in backend_update.items():
-                    last_update['backend_' + key] = value
+                update_start = time.time()
+                last_update = dmc_update(
+                    model, optimizer, batch, args, learner_device)
+                last_update['update_ms'] = (
+                    time.time() - update_start) * 1000.0
+                last_update['update_samples'] = len(batch)
                 since_update = 0
 
             if next_publish is not None and frames >= next_publish:
-                _publish_teacher(teacher, weight_path)
+                _publish_model(model, weight_path)
                 while frames >= next_publish:
                     next_publish += args.weight_publish_every
 
@@ -312,14 +406,13 @@ def main():
             should_eval = next_eval is not None and frames >= next_eval
             metrics = {}
             if should_eval:
-                teacher.eval()
-                backend.eval()
+                model.eval()
                 metrics.update(evaluate(
-                    teacher, args, learner_device, 'teacher_eval'))
-                metrics.update(evaluate(
-                    backend, args, learner_device, 'backend_eval'))
-                teacher.train()
-                backend.train()
+                    model, args, learner_device, 'eval'))
+                write_eval_records(
+                    model, args, learner_device, args.eval_record_jsonl,
+                    frames, episodes)
+                model.train()
                 while frames >= next_eval:
                     next_eval += args.eval_every
 
@@ -333,16 +426,38 @@ def main():
                     'queue': queue.qsize() if hasattr(queue, 'qsize') else -1,
                     'loss': last_update.get('loss'),
                     'abs_error': last_update.get('abs_error'),
-                    'backend_loss': last_update.get('backend_loss'),
-                    'backend_abs_error': last_update.get('backend_abs_error'),
+                    'q_mean': last_update.get('q_mean'),
+                    'grad_norm': last_update.get('grad_norm'),
+                    'update_ms': last_update.get('update_ms'),
+                    'update_batches_done': last_update.get(
+                        'update_batches_done'),
+                    'update_samples': last_update.get('update_samples'),
                     'invalid': recent['invalid'],
                     'actor_errors': recent['actor_errors'],
+                    'queue_timeouts': recent['queue_timeouts'],
+                    'plays': recent['plays'],
+                    'passes': recent['passes'],
+                    'explore_actions': recent['explore_actions'],
                     'cha_asks': recent['cha_asks'],
                     'cha_declines': recent['cha_declines'],
                     'dian_asks': recent['dian_asks'],
                     'dian_declines': recent['dian_declines'],
                 })
                 metrics.update(_aggregate_rates(recent))
+                metrics['avg_q_gap'] = (
+                    metrics.get('avg_greedy_q', 0.0)
+                    - metrics.get('avg_selected_q', 0.0))
+                action_total = max(1, metrics['plays'] + metrics['passes'])
+                decision_total = max(
+                    1, metrics['plays'] + metrics['passes']
+                    + metrics['cha_asks'] + metrics['dian_asks'])
+                metrics['pass_rate'] = metrics['passes'] / action_total
+                metrics['explore_rate'] = (
+                    metrics['explore_actions'] / decision_total)
+                metrics['cha_decline_rate'] = (
+                    metrics['cha_declines'] / max(1, metrics['cha_asks']))
+                metrics['dian_decline_rate'] = (
+                    metrics['dian_declines'] / max(1, metrics['dian_asks']))
                 _log(metrics)
                 _write_jsonl(args.log_jsonl, metrics)
                 recent = Counter()
@@ -352,15 +467,13 @@ def main():
             while next_checkpoint is not None and frames >= next_checkpoint:
                 path = _checkpoint_path(args.save, next_checkpoint)
                 save_checkpoint(
-                    teacher, backend, teacher_optimizer, backend_optimizer,
-                    path, frames, episodes, args, last_update)
-                print('checkpoint_saved=%s' % path, flush=True)
+                    model, optimizer, path, frames, episodes, args, last_update)
+                print('checkpoint已保存=%s' % path, flush=True)
                 next_checkpoint += args.checkpoint_every
 
         save_checkpoint(
-            teacher, backend, teacher_optimizer, backend_optimizer,
-            args.save, frames, episodes, args, last_update)
-        print('final_checkpoint=%s frames=%d episodes=%d' % (
+            model, optimizer, args.save, frames, episodes, args, last_update)
+        print('最终checkpoint=%s 样本步数=%d 局数=%d' % (
             args.save, frames, episodes), flush=True)
     finally:
         stop_event.set()

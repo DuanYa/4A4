@@ -285,6 +285,28 @@ def encode_history(state, perspective_seat):
 def encode_action(action, hand, level_rank):
     """将候选动作编码为固定长度向量"""
     vec = [0.0] * ACTION_DIM
+    action_type = action.get('type')
+    if action_type in ('cha', 'dian'):
+        do_action = bool(action.get('do'))
+        if action_type == 'cha':
+            vec[64 if do_action else 65] = 1.0
+            need = 2
+        else:
+            vec[66 if do_action else 67] = 1.0
+            need = 1
+        rank = action.get('rank') or action.get('cha_rank') or level_rank
+        counts = _rank_counts(hand)
+        if rank in RANKS:
+            vec[13 + _rank_index(rank)] = counts.get(rank, 0) / 4.0
+            vec[68] = counts.get(rank, 0) / 4.0
+        remain_size = max(0, len(hand) - (need if do_action else 0))
+        vec[55] = remain_size / 14.0
+        vec[62] = 1.0 if remain_size == 0 else 0.0
+        vec[69] = 1.0 if remain_size <= 2 else 0.0
+        vec[70] = 1.0 if do_action else 0.0
+        vec[71] = 1.0 if not do_action else 0.0
+        return vec
+
     if action.get('type') == 'pass':
         vec[0] = 1.0
         vec[55] = len(hand) / 14.0

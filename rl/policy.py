@@ -51,3 +51,41 @@ class NeuralPolicy:
             return best_action.get('indices', [])
         except Exception:
             return fallback_fn()
+
+    def choose_binary(self, state, hand, level_rank, seat, action_type,
+                      fallback_fn):
+        """Choose cha/dian response. Returns True for action, False for decline."""
+        if self.model is None or torch is None:
+            return fallback_fn()
+        if action_type not in ('cha', 'dian'):
+            return fallback_fn()
+
+        try:
+            rank = state.get('cha_rank') if state else level_rank
+            actions = [
+                {'type': action_type, 'do': True, 'rank': rank},
+                {'type': action_type, 'do': False, 'rank': rank},
+            ]
+            state_vec = torch.tensor(
+                encode_state(state, hand, level_rank, seat),
+                dtype=torch.float32)
+            action_vecs = torch.tensor(
+                [encode_action(a, hand, level_rank) for a in actions],
+                dtype=torch.float32)
+            history_vecs = torch.tensor(
+                encode_history(state, seat),
+                dtype=torch.float32)
+            with torch.no_grad():
+                scores = self.model(state_vec, action_vecs, history_vecs)
+            best_idx = int(torch.argmax(scores).item())
+            return bool(actions[best_idx]['do'])
+        except Exception:
+            return fallback_fn()
+
+    def choose_cha(self, state, hand, level_rank, seat, fallback_fn):
+        return self.choose_binary(
+            state, hand, level_rank, seat, 'cha', fallback_fn)
+
+    def choose_dian(self, state, hand, level_rank, seat, fallback_fn):
+        return self.choose_binary(
+            state, hand, level_rank, seat, 'dian', fallback_fn)

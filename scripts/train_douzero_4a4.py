@@ -18,7 +18,6 @@ ROOT = os.path.dirname(os.path.dirname(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from douzero_4a4.model import DouZero4A4Model
 from douzero_4a4.rewards import seat_rewards
 from models.game import Game, GamePhase
 from models.hand_type import HandType, HandCategory, identify_hand
@@ -95,10 +94,8 @@ def _forward_action_values(model, seat, state_vec, action_vecs, history_vec):
     return model(state_vec, action_vecs, history_vec)
 
 
-def _select_model_action(model, state, hand, level_rank, seat, last_ht,
-                         is_free_play, epsilon, device, train=True):
-    actions = enumerate_legal_actions(
-        hand, level_rank, last_ht, is_free_play)
+def _select_from_actions(model, state, hand, level_rank, seat, actions,
+                         epsilon, device, train=True):
     if not actions:
         return {'type': 'pass', 'indices': [], 'hand_type': None}, None, {}
 
@@ -142,19 +139,49 @@ def _select_model_action(model, state, hand, level_rank, seat, last_ht,
     return actions[action_idx], decision, info
 
 
+def _select_model_action(model, state, hand, level_rank, seat, last_ht,
+                         is_free_play, epsilon, device, train=True):
+    actions = enumerate_legal_actions(
+        hand, level_rank, last_ht, is_free_play)
+    return _select_from_actions(
+        model, state, hand, level_rank, seat, actions, epsilon, device, train)
+
+
+def _select_binary_action(model, state, hand, level_rank, seat, action_type,
+                          rank, epsilon, device, train=True):
+    actions = [
+        {'type': action_type, 'do': True, 'rank': rank},
+        {'type': action_type, 'do': False, 'rank': rank},
+    ]
+    return _select_from_actions(
+        model, state, hand, level_rank, seat, actions, epsilon, device, train)
+
+
 def _random_level(configured):
     if configured and configured != 'random':
         return configured
     return random.choice(LEVEL_ORDER)
 
 
-def run_episode(model, args, device, train=True, model_team=None):
+def run_episode(model, args, device, train=True, model_team=None,
+                return_record=False):
     level_rank = _random_level(args.level_rank)
     on_stage_team = random.randrange(2)
     players = [Player('dz4a4-%d' % i, 'DZ4A4-%d' % i, i)
                for i in range(4)]
     game = Game(players, level_rank, on_stage_team)
     game.start()
+    record = None
+    if return_record:
+        record = {
+            'level_rank': level_rank,
+            'on_stage_team': on_stage_team,
+            'model_team': model_team,
+            'initial_hands': {
+                str(p.seat): [card.to_dict() for card in p.hand]
+                for p in players
+            },
+        }
 
     trajectories = [[] for _ in range(4)]
     stats = Counter()
@@ -173,18 +200,54 @@ def run_episode(model, args, device, train=True, model_team=None):
 
         if game.phase == GamePhase.CHA_ASKING:
             stats['cha_asks'] += 1
-            do_cha = _training_should_cha(game, game.cha_asking_seat)
+            seat = game.cha_asking_seat
+            player = players[seat]
+            state = game.get_state(for_seat=seat)
+            use_model = model_team is None or seat % 2 == model_team
+            if use_model:
+                action, decision, info = _select_binary_action(
+                    model, state, player.hand, level_rank, seat,
+                    'cha', game.cha_rank, epsilon, device, train)
+                if decision is not None:
+                    trajectories[seat].append(decision)
+                if info:
+                    candidate_counts.append(info['candidate_count'])
+                    q_selected.append(info['selected_q'])
+                    q_greedy.append(info['greedy_q'])
+                    if info['explored']:
+                        stats['explore_actions'] += 1
+                do_cha = bool(action.get('do'))
+            else:
+                do_cha = _training_should_cha(game, seat)
             if not do_cha:
                 stats['cha_declines'] += 1
-            game.respond_cha(game.cha_asking_seat, do_cha)
+            game.respond_cha(seat, do_cha)
             continue
 
         if game.phase == GamePhase.DIAN_ASKING:
             stats['dian_asks'] += 1
-            do_dian = _training_should_dian(game, game.dian_asking_seat)
+            seat = game.dian_asking_seat
+            player = players[seat]
+            state = game.get_state(for_seat=seat)
+            use_model = model_team is None or seat % 2 == model_team
+            if use_model:
+                action, decision, info = _select_binary_action(
+                    model, state, player.hand, level_rank, seat,
+                    'dian', game.cha_rank, epsilon, device, train)
+                if decision is not None:
+                    trajectories[seat].append(decision)
+                if info:
+                    candidate_counts.append(info['candidate_count'])
+                    q_selected.append(info['selected_q'])
+                    q_greedy.append(info['greedy_q'])
+                    if info['explored']:
+                        stats['explore_actions'] += 1
+                do_dian = bool(action.get('do'))
+            else:
+                do_dian = _training_should_dian(game, seat)
             if not do_dian:
                 stats['dian_declines'] += 1
-            game.respond_dian(game.dian_asking_seat, do_dian)
+            game.respond_dian(seat, do_dian)
             continue
 
         if game.phase != GamePhase.PLAYING:
@@ -258,6 +321,11 @@ def run_episode(model, args, device, train=True, model_team=None):
     stats['finished'] += int(finished)
     stats['winner_team_%s' % reward_info['winner_team']] += 1
     stats['result_' + reward_info['winner_result']] += 1
+    winner_team = reward_info['winner_team']
+    winner_result = reward_info['winner_result']
+    if winner_team in (0, 1):
+        stats['team%d_wins' % winner_team] += 1
+        stats['team%d_%s' % (winner_team, winner_result)] += 1
     stats['stage_changes'] += int(reward_info['stage_change'])
     stats['transitions'] += len(transitions)
     stats['team0_reward_x1000'] += int(rewards[0] * 1000)
@@ -268,6 +336,18 @@ def run_episode(model, args, device, train=True, model_team=None):
         (sum(q_selected) / len(q_selected) if q_selected else 0) * 1000)
     stats['avg_greedy_q_x1000'] += int(
         (sum(q_greedy) / len(q_greedy) if q_greedy else 0) * 1000)
+    if return_record:
+        record.update({
+            'finished': finished,
+            'finish_order': list(game.finish_order),
+            'winner_team': reward_info['winner_team'],
+            'winner_result': reward_info['winner_result'],
+            'stage_change': reward_info['stage_change'],
+            'rewards': list(rewards),
+            'play_history': list(game.play_history),
+            'stats': dict(stats),
+        })
+        return transitions, stats, record
     return transitions, stats
 
 
@@ -279,23 +359,32 @@ def dmc_update(model, optimizer, transitions, args, device):
     abs_errors = []
     q_means = []
     grad_norm = 0.0
+    batches = 0
 
     for start in range(0, len(transitions), args.batch_size):
         batch = transitions[start:start + args.batch_size]
-        preds = []
-        targets = []
-        for item in batch:
-            item_state = item.state_vec.to(device)
-            item_actions = item.action_vecs.to(device)
-            item_history = item.history_vec.to(device)
-            q_values = _forward_action_values(
-                model, item.seat, item_state, item_actions,
-                item_history)
-            preds.append(q_values[item.action_index].reshape(()))
-            targets.append(torch.tensor(item.reward, dtype=torch.float32,
-                                        device=device))
-        pred = torch.stack(preds)
-        target = torch.stack(targets)
+        max_actions = max(item.action_vecs.shape[0] for item in batch)
+        action_dim = batch[0].action_vecs.shape[-1]
+        state = torch.stack(
+            [item.state_vec for item in batch]).to(device, non_blocking=True)
+        history = torch.stack(
+            [item.history_vec for item in batch]).to(device, non_blocking=True)
+        actions = torch.zeros(
+            len(batch), max_actions, action_dim,
+            dtype=torch.float32, device=device)
+        for row, item in enumerate(batch):
+            count = item.action_vecs.shape[0]
+            actions[row, :count] = item.action_vecs.to(
+                device, non_blocking=True)
+        action_index = torch.tensor(
+            [item.action_index for item in batch],
+            dtype=torch.long, device=device)
+        target = torch.tensor(
+            [item.reward for item in batch],
+            dtype=torch.float32, device=device)
+
+        q_values = model(state, actions, history)
+        pred = q_values.gather(1, action_index.unsqueeze(1)).squeeze(1)
         loss = torch.nn.functional.mse_loss(pred, target)
 
         optimizer.zero_grad()
@@ -303,6 +392,7 @@ def dmc_update(model, optimizer, transitions, args, device):
         grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
             model.parameters(), args.max_grad_norm)
         optimizer.step()
+        batches += 1
 
         with torch.no_grad():
             losses.append(float(loss.detach().cpu().item()))
@@ -316,23 +406,18 @@ def dmc_update(model, optimizer, transitions, args, device):
         'abs_error': sum(abs_errors) / len(abs_errors),
         'q_mean': sum(q_means) / len(q_means),
         'grad_norm': grad_norm,
+        'update_batches_done': batches,
     }
 
 
-def save_checkpoint(douzero_model, backend_model, douzero_optimizer,
-                    backend_optimizer, path, frames, episodes, args,
-                    metrics):
+def save_checkpoint(model, optimizer, path, frames, episodes, args, metrics):
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
     torch.save({
-        # Existing backend loads exactly this key into rl.model.CardPolicyNetwork.
-        'model_state_dict': backend_model.state_dict(),
-        'optimizer_state_dict': backend_optimizer.state_dict(),
-        'douzero_model_state_dict': douzero_model.state_dict(),
-        'douzero_optimizer_state_dict': douzero_optimizer.state_dict(),
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
         'global_step': frames,
         'episode': episodes,
-        'model_type': 'douzero_4a4_dmc_backend_compatible',
-        'teacher_model_class': 'douzero_4a4.model.DouZero4A4Model',
+        'model_type': 'shared_rope_transformer_full_action_dmc',
         'backend_model_class': 'rl.model.CardPolicyNetwork',
         'reward_version': 'terminal_team_utility_v1',
         'args': vars(args),
@@ -355,22 +440,17 @@ def _load_compatible(module, state_dict):
     module.load_state_dict(current)
 
 
-def _load_resume(douzero_model, backend_model, douzero_optimizer,
-                 backend_optimizer, path, device):
+def _load_resume(model, optimizer, path, device):
     if not path or not os.path.exists(path):
         return 0, 0
     payload = torch.load(path, map_location=device)
-    if 'douzero_model_state_dict' in payload:
-        douzero_model.load_state_dict(payload['douzero_model_state_dict'])
-    elif 'model_state_dict' in payload:
-        _load_compatible(douzero_model, payload['model_state_dict'])
     if 'model_state_dict' in payload:
-        _load_compatible(backend_model, payload['model_state_dict'])
-    if 'douzero_optimizer_state_dict' in payload:
-        douzero_optimizer.load_state_dict(
-            payload['douzero_optimizer_state_dict'])
+        _load_compatible(model, payload['model_state_dict'])
     if 'optimizer_state_dict' in payload:
-        backend_optimizer.load_state_dict(payload['optimizer_state_dict'])
+        try:
+            optimizer.load_state_dict(payload['optimizer_state_dict'])
+        except ValueError:
+            pass
     return int(payload.get('global_step', 0)), int(payload.get('episode', 0))
 
 
@@ -389,10 +469,32 @@ def evaluate(model, args, device, metric_prefix='eval'):
         total['episodes'] += 1
         if stats.get('winner_team_%d' % model_team):
             total['model_team_wins'] += 1
+            if stats.get('result_quan_dong'):
+                total['model_team_quan_dong'] += 1
+            if stats.get('result_ban_dong'):
+                total['model_team_ban_dong'] += 1
+        else:
+            rule_team = 1 - model_team
+            if stats.get('winner_team_%d' % rule_team):
+                total['rule_team_wins'] += 1
+                if stats.get('result_quan_dong'):
+                    total['rule_team_quan_dong'] += 1
+                if stats.get('result_ban_dong'):
+                    total['rule_team_ban_dong'] += 1
     return {
         metric_prefix + '_episodes': total['episodes'],
         metric_prefix + '_model_team_win_rate': _counter_rate(
             total, 'model_team_wins'),
+        metric_prefix + '_model_team_full_hole_rate': _counter_rate(
+            total, 'model_team_quan_dong'),
+        metric_prefix + '_model_team_half_hole_rate': _counter_rate(
+            total, 'model_team_ban_dong'),
+        metric_prefix + '_rule_team_win_rate': _counter_rate(
+            total, 'rule_team_wins'),
+        metric_prefix + '_rule_team_full_hole_rate': _counter_rate(
+            total, 'rule_team_quan_dong'),
+        metric_prefix + '_rule_team_half_hole_rate': _counter_rate(
+            total, 'rule_team_ban_dong'),
         metric_prefix + '_full_hole_rate': _counter_rate(
             total, 'result_quan_dong'),
         metric_prefix + '_half_hole_rate': _counter_rate(
@@ -403,25 +505,103 @@ def evaluate(model, args, device, metric_prefix='eval'):
     }
 
 
+def write_eval_records(model, args, device, path, frames, episodes):
+    if not path or getattr(args, 'eval_record_episodes', 0) <= 0:
+        return
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    records = []
+    for i in range(args.eval_record_episodes):
+        model_team = i % 2
+        _, _, record = run_episode(
+            model, args, device, train=False, model_team=model_team,
+            return_record=True)
+        record['frames'] = frames
+        record['episodes'] = episodes
+        record['record_index'] = i
+        records.append(record)
+    with open(path, 'a', encoding='utf-8') as f:
+        for record in records:
+            f.write(json.dumps(record, ensure_ascii=False) + '\n')
+
+
 def _format_float(value):
     if value is None:
         return 'NA'
     return '%.5f' % value
 
 
+CN_KEYS = {
+    'episode': '局数',
+    'frames': '样本步数',
+    'fps': '每秒样本',
+    'epsilon': '探索率',
+    'buffer': '缓冲区样本',
+    'loss': '训练损失',
+    'abs_error': '平均绝对误差',
+    'q_mean': '平均Q值',
+    'grad_norm': '梯度范数',
+    'update_batches_done': '更新批次数',
+    'team0_reward_mean': 'A队平均终局收益',
+    'terminal_utility_abs_mean': '终局收益绝对值',
+    'finish_rate': '正常结束率',
+    'full_hole_rate': '全洞率',
+    'half_hole_rate': '半洞率',
+    'stage_change_rate': '台上切换率',
+    'team0_win_rate': '0队胜率',
+    'team1_win_rate': '1队胜率',
+    'team0_full_hole_rate': '0队全洞率',
+    'team0_half_hole_rate': '0队半洞率',
+    'team1_full_hole_rate': '1队全洞率',
+    'team1_half_hole_rate': '1队半洞率',
+    'invalid': '非法动作数',
+    'avg_candidates': '平均候选动作数',
+    'avg_selected_q': '平均所选Q值',
+    'avg_greedy_q': '平均贪心Q值',
+    'avg_q_gap': '平均探索Q差',
+    'plays': '出牌次数',
+    'passes': '过牌次数',
+    'pass_rate': '过牌率',
+    'explore_actions': '探索动作数',
+    'explore_rate': '探索动作率',
+    'cha_asks': '叉牌询问数',
+    'dian_asks': '点牌询问数',
+    'cha_declines': '不叉次数',
+    'dian_declines': '不点次数',
+    'cha_decline_rate': '不叉率',
+    'dian_decline_rate': '不点率',
+    'eval_model_team_win_rate': '评估胜率',
+    'eval_model_team_full_hole_rate': '评估模型队全洞率',
+    'eval_model_team_half_hole_rate': '评估模型队半洞率',
+    'eval_rule_team_win_rate': '评估规则队胜率',
+    'eval_rule_team_full_hole_rate': '评估规则队全洞率',
+    'eval_rule_team_half_hole_rate': '评估规则队半洞率',
+    'eval_full_hole_rate': '评估全洞率',
+    'eval_half_hole_rate': '评估半洞率',
+    'eval_truncated_rate': '评估截断率',
+    'eval_invalid': '评估非法动作数',
+}
+
+
 def _log_line(metrics):
     keys = [
         'episode', 'frames', 'fps', 'epsilon', 'buffer',
         'loss', 'abs_error', 'q_mean', 'grad_norm',
-        'backend_loss', 'backend_abs_error', 'backend_q_mean',
-        'backend_grad_norm',
-        'team0_reward_mean', 'terminal_utility_abs_mean', 'finish_rate', 'full_hole_rate',
-        'half_hole_rate', 'stage_change_rate', 'invalid',
+        'update_batches_done',
+        'team0_reward_mean', 'terminal_utility_abs_mean',
+        'finish_rate', 'full_hole_rate', 'half_hole_rate',
+        'stage_change_rate', 'team0_win_rate', 'team1_win_rate',
+        'team0_full_hole_rate', 'team0_half_hole_rate',
+        'team1_full_hole_rate', 'team1_half_hole_rate', 'invalid',
         'avg_candidates', 'avg_selected_q', 'avg_greedy_q',
-        'plays', 'passes', 'cha_asks', 'dian_asks',
-        'cha_declines', 'dian_declines',
-        'teacher_eval_model_team_win_rate',
-        'backend_eval_model_team_win_rate',
+        'avg_q_gap', 'plays', 'passes', 'pass_rate',
+        'explore_actions', 'explore_rate',
+        'cha_asks', 'cha_declines', 'cha_decline_rate',
+        'dian_asks', 'dian_declines', 'dian_decline_rate',
+        'eval_model_team_win_rate', 'eval_model_team_full_hole_rate',
+        'eval_model_team_half_hole_rate', 'eval_rule_team_win_rate',
+        'eval_rule_team_full_hole_rate', 'eval_rule_team_half_hole_rate',
+        'eval_full_hole_rate', 'eval_half_hole_rate',
+        'eval_truncated_rate', 'eval_invalid',
     ]
     parts = []
     for key in keys:
@@ -430,7 +610,7 @@ def _log_line(metrics):
         value = metrics[key]
         if isinstance(value, float):
             value = _format_float(value)
-        parts.append('%s=%s' % (key, value))
+        parts.append('%s=%s' % (CN_KEYS.get(key, key), value))
     print(' '.join(parts), flush=True)
 
 
@@ -438,8 +618,9 @@ def _write_jsonl(path, metrics):
     if not path:
         return
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    cn_metrics = {CN_KEYS.get(key, key): value for key, value in metrics.items()}
     with open(path, 'a', encoding='utf-8') as f:
-        f.write(json.dumps(metrics, ensure_ascii=False, sort_keys=True) + '\n')
+        f.write(json.dumps(cn_metrics, ensure_ascii=False, sort_keys=True) + '\n')
 
 
 def main():
@@ -448,7 +629,6 @@ def main():
     parser.add_argument('--episodes', type=int, default=0)
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--backend-lr', type=float, default=1e-4)
     parser.add_argument('--batch-size', type=int, default=128)
     parser.add_argument('--update-frames', type=int, default=4096)
     parser.add_argument('--epsilon', type=float, default=0.08)
@@ -469,6 +649,9 @@ def main():
         ROOT, 'logs', 'douzero_4a4_metrics.jsonl'))
     parser.add_argument('--eval-every', type=int, default=50000)
     parser.add_argument('--eval-episodes', type=int, default=64)
+    parser.add_argument('--eval-record-episodes', type=int, default=4)
+    parser.add_argument('--eval-record-jsonl', default=os.path.join(
+        ROOT, 'logs', 'douzero_4a4_eval_records.jsonl'))
     args = parser.parse_args()
 
     if torch is None:
@@ -479,17 +662,11 @@ def main():
         args.device = 'cpu'
     device = torch.device(args.device)
 
-    douzero_model = DouZero4A4Model().to(device)
-    backend_model = CardPolicyNetwork().to(device)
-    douzero_optimizer = torch.optim.RMSprop(
-        douzero_model.parameters(), lr=args.lr, momentum=0.0,
+    model = CardPolicyNetwork().to(device)
+    optimizer = torch.optim.RMSprop(
+        model.parameters(), lr=args.lr, momentum=0.0,
         eps=1e-5, alpha=0.99)
-    backend_optimizer = torch.optim.RMSprop(
-        backend_model.parameters(), lr=args.backend_lr, momentum=0.0,
-        eps=1e-5, alpha=0.99)
-    frames, episode = _load_resume(
-        douzero_model, backend_model, douzero_optimizer,
-        backend_optimizer, args.resume, device)
+    frames, episode = _load_resume(model, optimizer, args.resume, device)
     buffer = []
     next_checkpoint = None
     if args.checkpoint_every:
@@ -517,12 +694,12 @@ def main():
             collect_count = max(1, collect_count)
 
         episode_results = []
-        douzero_model.eval()
+        model.eval()
         if args.num_actors > 1 and collect_count > 1:
             with ThreadPoolExecutor(max_workers=args.num_actors) as executor:
                 futures = [
                     executor.submit(
-                        run_episode, douzero_model, args, device, True)
+                        run_episode, model, args, device, True)
                     for _ in range(collect_count)
                 ]
                 for future in as_completed(futures):
@@ -530,8 +707,8 @@ def main():
         else:
             for _ in range(collect_count):
                 episode_results.append(
-                    run_episode(douzero_model, args, device, train=True))
-        douzero_model.train()
+                    run_episode(model, args, device, train=True))
+        model.train()
 
         for transitions, stats in episode_results:
             episode += 1
@@ -544,27 +721,19 @@ def main():
             recent_abs_utilities.append(abs(team0_reward))
 
         if len(buffer) >= args.update_frames:
-            teacher_update = dmc_update(
-                douzero_model, douzero_optimizer, buffer, args, device)
-            backend_update = dmc_update(
-                backend_model, backend_optimizer, buffer, args, device)
-            last_update = dict(teacher_update)
-            for key, value in backend_update.items():
-                last_update['backend_' + key] = value
+            last_update = dmc_update(model, optimizer, buffer, args, device)
             buffer.clear()
 
         should_log = episode <= 5 or episode % args.log_every == 0
         should_eval = next_eval is not None and frames >= next_eval
         eval_metrics = {}
         if should_eval:
-            douzero_model.eval()
-            backend_model.eval()
-            eval_metrics.update(evaluate(
-                douzero_model, args, device, 'teacher_eval'))
-            eval_metrics.update(evaluate(
-                backend_model, args, device, 'backend_eval'))
-            douzero_model.train()
-            backend_model.train()
+            model.eval()
+            eval_metrics.update(evaluate(model, args, device, 'eval'))
+            write_eval_records(
+                model, args, device, args.eval_record_jsonl,
+                frames, episode)
+            model.train()
             while frames >= next_eval:
                 next_eval += args.eval_every
 
@@ -581,10 +750,6 @@ def main():
                 'abs_error': last_update.get('abs_error'),
                 'q_mean': last_update.get('q_mean'),
                 'grad_norm': last_update.get('grad_norm'),
-                'backend_loss': last_update.get('backend_loss'),
-                'backend_abs_error': last_update.get('backend_abs_error'),
-                'backend_q_mean': last_update.get('backend_q_mean'),
-                'backend_grad_norm': last_update.get('backend_grad_norm'),
                 'team0_reward_mean': (
                     sum(recent_team0_rewards)
                     / max(1, len(recent_team0_rewards))),
@@ -595,6 +760,16 @@ def main():
                 'full_hole_rate': recent['result_quan_dong'] / episodes_n,
                 'half_hole_rate': recent['result_ban_dong'] / episodes_n,
                 'stage_change_rate': recent['stage_changes'] / episodes_n,
+                'team0_win_rate': recent['team0_wins'] / episodes_n,
+                'team1_win_rate': recent['team1_wins'] / episodes_n,
+                'team0_full_hole_rate': (
+                    recent['team0_quan_dong'] / episodes_n),
+                'team0_half_hole_rate': (
+                    recent['team0_ban_dong'] / episodes_n),
+                'team1_full_hole_rate': (
+                    recent['team1_quan_dong'] / episodes_n),
+                'team1_half_hole_rate': (
+                    recent['team1_ban_dong'] / episodes_n),
                 'invalid': recent['invalid'],
                 'avg_candidates': (
                     recent['avg_candidates_x1000'] / max(1, episodes_n) / 1000.0),
@@ -610,6 +785,15 @@ def main():
                 'dian_declines': recent['dian_declines'],
                 'explore_actions': recent['explore_actions'],
             }
+            metrics['avg_q_gap'] = metrics['avg_greedy_q'] - metrics['avg_selected_q']
+            action_total = max(1, metrics['plays'] + metrics['passes'])
+            decision_total = max(
+                1, metrics['plays'] + metrics['passes']
+                + metrics['cha_asks'] + metrics['dian_asks'])
+            metrics['pass_rate'] = metrics['passes'] / action_total
+            metrics['explore_rate'] = metrics['explore_actions'] / decision_total
+            metrics['cha_decline_rate'] = metrics['cha_declines'] / max(1, metrics['cha_asks'])
+            metrics['dian_decline_rate'] = metrics['dian_declines'] / max(1, metrics['dian_asks'])
             metrics.update(eval_metrics)
             _log_line(metrics)
             _write_jsonl(args.log_jsonl, metrics)
@@ -617,24 +801,16 @@ def main():
 
         while next_checkpoint is not None and frames >= next_checkpoint:
             path = _checkpoint_path(args.save, next_checkpoint)
-            save_checkpoint(douzero_model, backend_model, douzero_optimizer,
-                            backend_optimizer, path, frames, episode,
+            save_checkpoint(model, optimizer, path, frames, episode,
                             args, last_update)
-            print('checkpoint_saved=%s' % path, flush=True)
+            print('checkpoint已保存=%s' % path, flush=True)
             next_checkpoint += args.checkpoint_every
 
     if buffer:
-        teacher_update = dmc_update(
-            douzero_model, douzero_optimizer, buffer, args, device)
-        backend_update = dmc_update(
-            backend_model, backend_optimizer, buffer, args, device)
-        last_update = dict(teacher_update)
-        for key, value in backend_update.items():
-            last_update['backend_' + key] = value
-    save_checkpoint(douzero_model, backend_model, douzero_optimizer,
-                    backend_optimizer, args.save, frames, episode,
+        last_update = dmc_update(model, optimizer, buffer, args, device)
+    save_checkpoint(model, optimizer, args.save, frames, episode,
                     args, last_update)
-    print('final_checkpoint=%s frames=%d episode=%d' % (
+    print('最终checkpoint=%s 样本步数=%d 局数=%d' % (
         args.save, frames, episode), flush=True)
 
 
