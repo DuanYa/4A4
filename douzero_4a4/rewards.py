@@ -6,6 +6,11 @@ decision made by two teammates receives exactly the same terminal utility.
 """
 from models.room import MUST_QUAN_DONG
 
+RANKS = ['3', '4', '5', '6', '7', '8', '9', '10',
+         'J', 'Q', 'K', 'A', '2', 'BJ', 'RJ']
+STRAIGHT_RANKS = ['3', '4', '5', '6', '7', '8', '9', '10',
+                  'J', 'Q', 'K', 'A']
+
 
 RESULT_LOSE = 'lose'
 RESULT_BAN_DONG = 'ban_dong'
@@ -92,3 +97,121 @@ def seat_rewards(finish_order, level_rank='3', on_stage_team=0):
     rewards = [utilities[seat % 2] for seat in range(4)]
     return rewards, info
 
+
+def _rank_counts(cards):
+    counts = [0] * len(RANKS)
+    for card in cards:
+        rank = card.rank if hasattr(card, 'rank') else card.get('rank', '3')
+        if rank in RANKS:
+            counts[RANKS.index(rank)] += 1
+    return tuple(counts)
+
+
+def _remove_long_runs(counts, need, min_len, level_rank):
+    counts = list(counts)
+    steps = 0
+    allowed = [
+        RANKS.index(rank) for rank in STRAIGHT_RANKS
+        if rank != level_rank
+    ]
+    while True:
+        best = []
+        run = []
+        prev_pos = None
+        for idx in allowed:
+            pos = STRAIGHT_RANKS.index(RANKS[idx])
+            if counts[idx] >= need and (prev_pos is None or pos == prev_pos + 1):
+                run.append(idx)
+            else:
+                if len(run) > len(best):
+                    best = run
+                run = [idx] if counts[idx] >= need else []
+            prev_pos = pos if counts[idx] >= need else None
+        if len(run) > len(best):
+            best = run
+        if len(best) < min_len:
+            break
+        for idx in best:
+            counts[idx] -= need
+        steps += 1
+    return tuple(counts), steps
+
+
+def minimum_play_steps(cards, level_rank='3', _cache=None):
+    """Fast perfect-information estimate for minimum play-out steps.
+
+    It ignores opponents' responses and greedily packs long double-straights
+    and straights before counting remaining legal groups. This preserves the
+    winning-distance signal without putting an expensive search in every actor
+    step.
+    """
+    counts = _rank_counts(cards)
+    if _cache is None:
+        _cache = {}
+    key = (counts, level_rank)
+    if key in _cache:
+        return _cache[key]
+
+    counts, pair_steps = _remove_long_runs(counts, 2, 3, level_rank)
+    counts, straight_steps = _remove_long_runs(counts, 1, 3, level_rank)
+    steps = pair_steps + straight_steps
+
+    bj = RANKS.index('BJ')
+    rj = RANKS.index('RJ')
+    counts = list(counts)
+    if counts[bj] and counts[rj]:
+        counts[bj] -= 1
+        counts[rj] -= 1
+        steps += 1
+
+    four = RANKS.index('4')
+    ace = RANKS.index('A')
+    if counts[four] >= 2 and counts[ace] >= 1:
+        counts[four] -= 2
+        counts[ace] -= 1
+        steps += 1
+
+    for idx, count in enumerate(counts):
+        if count <= 0:
+            continue
+        rank = RANKS[idx]
+        if rank in ('BJ', 'RJ'):
+            steps += count
+        else:
+            # Any same-rank residue up to four cards can be played as one
+            # single/pair/bomb group in this distance estimate.
+            steps += 1
+    _cache[key] = steps
+    return steps
+
+
+def team_winning_distances(players, level_rank='3'):
+    cache = {}
+    seat_steps = {
+        player.seat: minimum_play_steps(player.hand, level_rank, cache)
+        for player in players
+    }
+    team_steps = {
+        team: min(seat_steps[seat] for seat in seat_steps if seat % 2 == team)
+        for team in (0, 1)
+    }
+    return seat_steps, team_steps
+
+
+def team_distance_advantages(players, level_rank='3'):
+    """Return larger-is-better distance advantage for each team."""
+    _, team_steps = team_winning_distances(players, level_rank)
+    return {
+        0: team_steps[1] - team_steps[0],
+        1: team_steps[0] - team_steps[1],
+    }
+
+
+def distance_reward_delta(players_before, players_after, level_rank='3',
+                          scale=0.1):
+    before = team_distance_advantages(players_before, level_rank)
+    after = team_distance_advantages(players_after, level_rank)
+    return {
+        team: (after[team] - before[team]) * scale
+        for team in (0, 1)
+    }

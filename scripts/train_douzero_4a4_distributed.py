@@ -57,11 +57,22 @@ def _pack_cpu_transitions(transitions):
     return {
         'state_vecs': torch.stack(
             [item.state_vec.detach().cpu() for item in transitions]).numpy(),
+        'perfect_state_vecs': torch.stack(
+            [item.perfect_state_vec.detach().cpu()
+             for item in transitions]).numpy(),
         'history_vecs': history.numpy(),
         'history_counts': history_counts,
         'action_ids': actions.numpy(),
         'action_counts': action_counts,
         'action_indices': [item.action_index for item in transitions],
+        'old_log_probs': [
+            float(item.old_log_prob.detach().cpu().item())
+            for item in transitions],
+        'old_values': [
+            float(item.old_value.detach().cpu().item())
+            for item in transitions],
+        'advantages': [item.advantage for item in transitions],
+        'return_values': [item.return_value for item in transitions],
         'seats': [item.seat for item in transitions],
         'rewards': [item.reward for item in transitions],
     }
@@ -71,6 +82,7 @@ def _from_packed_transitions(items):
     if not items:
         return []
     state_vecs = torch.from_numpy(items['state_vecs']).float()
+    perfect_state_vecs = torch.from_numpy(items['perfect_state_vecs']).float()
     history_vecs = torch.from_numpy(items['history_vecs']).float()
     action_ids = torch.from_numpy(items['action_ids']).long()
     decisions = []
@@ -78,10 +90,15 @@ def _from_packed_transitions(items):
         history_count = items.get('history_counts', [history_vecs.shape[1]])[row]
         decisions.append(Decision(
             state_vec=state_vecs[row],
+            perfect_state_vec=perfect_state_vecs[row],
             history_vec=history_vecs[row, :history_count],
             action_ids=action_ids[row, :count],
             action_index=items['action_indices'][row],
             seat=items['seats'][row],
+            old_log_prob=torch.tensor(items['old_log_probs'][row]),
+            old_value=torch.tensor(items['old_values'][row]),
+            advantage=items.get('advantages', [0.0])[row],
+            return_value=items.get('return_values', items['rewards'])[row],
             reward=items['rewards'][row],
         ))
     return decisions
@@ -91,6 +108,8 @@ def _actor_args(args):
     keys = [
         'level_rank', 'max_episode_steps', 'epsilon', 'epsilon_eval',
         'batch_size', 'max_grad_norm',
+        'ppo_clip', 'gae_gamma', 'gae_lambda', 'value_loss_coef',
+        'entropy_coef', 'distance_reward_scale',
     ]
     data = {key: getattr(args, key) for key in keys}
     return SimpleNamespace(**data)
@@ -184,6 +203,13 @@ CN_KEYS = {
     'replay': '回放池样本',
     'queue': '采样队列',
     'loss': '训练损失',
+    'policy_loss': '策略损失',
+    'value_loss': '价值损失',
+    'entropy': '策略熵',
+    'approx_kl': '近似KL',
+    'clip_frac': '裁剪比例',
+    'adv_mean': '优势均值',
+    'adv_std': '优势标准差',
     'abs_error': '平均绝对误差',
     'q_mean': '平均Q值',
     'grad_norm': '梯度范数',
@@ -234,7 +260,10 @@ CN_KEYS = {
 def _log(metrics):
     keys = [
         'frames', 'episodes', 'fps', 'replay', 'queue',
-        'loss', 'abs_error', 'q_mean', 'grad_norm',
+        'loss', 'policy_loss', 'value_loss', 'entropy',
+        'approx_kl', 'clip_frac', 'adv_mean', 'adv_std',
+        'abs_error', 'q_mean',
+        'grad_norm',
         'update_ms', 'update_batches_done', 'update_samples',
         'finish_rate', 'full_hole_rate', 'half_hole_rate',
         'stage_change_rate',
@@ -305,6 +334,12 @@ def main():
     parser.add_argument('--epsilon', type=float, default=0.08)
     parser.add_argument('--epsilon-eval', type=float, default=0.0)
     parser.add_argument('--max-grad-norm', type=float, default=40.0)
+    parser.add_argument('--ppo-clip', type=float, default=0.2)
+    parser.add_argument('--gae-gamma', type=float, default=0.99)
+    parser.add_argument('--gae-lambda', type=float, default=0.95)
+    parser.add_argument('--value-loss-coef', type=float, default=0.5)
+    parser.add_argument('--entropy-coef', type=float, default=0.01)
+    parser.add_argument('--distance-reward-scale', type=float, default=0.1)
     parser.add_argument('--max-episode-steps', type=int, default=700)
     parser.add_argument('--level-rank', default='random',
                         choices=['random'] + LEVEL_ORDER)
@@ -435,6 +470,13 @@ def main():
                     'replay': len(replay),
                     'queue': queue.qsize() if hasattr(queue, 'qsize') else -1,
                     'loss': last_update.get('loss'),
+                    'policy_loss': last_update.get('policy_loss'),
+                    'value_loss': last_update.get('value_loss'),
+                    'entropy': last_update.get('entropy'),
+                    'approx_kl': last_update.get('approx_kl'),
+                    'clip_frac': last_update.get('clip_frac'),
+                    'adv_mean': last_update.get('adv_mean'),
+                    'adv_std': last_update.get('adv_std'),
                     'abs_error': last_update.get('abs_error'),
                     'q_mean': last_update.get('q_mean'),
                     'grad_norm': last_update.get('grad_norm'),

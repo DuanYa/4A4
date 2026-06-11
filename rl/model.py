@@ -20,6 +20,10 @@ HAND_CHANNELS = 5
 HAND_MATRIX_SIZE = HAND_CHANNELS * RANK_COUNT
 STATE_CONTEXT_DIM = 194
 STATE_DIM = HAND_MATRIX_SIZE + STATE_CONTEXT_DIM
+PERFECT_HAND_CHANNELS = HAND_CHANNELS * 4
+PERFECT_HAND_MATRIX_SIZE = PERFECT_HAND_CHANNELS * RANK_COUNT
+PERFECT_CONTEXT_DIM = 96
+PERFECT_STATE_DIM = PERFECT_HAND_MATRIX_SIZE + PERFECT_CONTEXT_DIM
 HISTORY_DIM = 5
 HIDDEN_DIM = 512
 HISTORY_LAYERS = 4
@@ -161,6 +165,42 @@ if nn is not None:
             ], dim=-1))
 
 
+    class PerfectStateEncoder(nn.Module):
+        def __init__(self, hidden_dim=HIDDEN_DIM):
+            super().__init__()
+            self.hand_conv = nn.Sequential(
+                nn.Conv1d(PERFECT_HAND_CHANNELS, 96, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv1d(96, 96, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Flatten(),
+                nn.Linear(96 * RANK_COUNT, hidden_dim // 2),
+                nn.LayerNorm(hidden_dim // 2),
+                nn.GELU(),
+            )
+            self.context_mlp = nn.Sequential(
+                nn.Linear(PERFECT_CONTEXT_DIM, hidden_dim // 2),
+                nn.LayerNorm(hidden_dim // 2),
+                nn.GELU(),
+                nn.Linear(hidden_dim // 2, hidden_dim // 2),
+                nn.GELU(),
+            )
+            self.out = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+            )
+
+        def forward(self, perfect_state_vec):
+            hands = perfect_state_vec[:, :PERFECT_HAND_MATRIX_SIZE].view(
+                -1, PERFECT_HAND_CHANNELS, RANK_COUNT)
+            context = perfect_state_vec[:, PERFECT_HAND_MATRIX_SIZE:]
+            return self.out(torch.cat([
+                self.hand_conv(hands),
+                self.context_mlp(context),
+            ], dim=-1))
+
+
     class RotaryHistoryEncoder(nn.Module):
         def __init__(self, action_embed, hidden_dim=HIDDEN_DIM,
                      nhead=8, num_layers=2, dropout=0.1):
@@ -219,6 +259,7 @@ if nn is not None:
                      hidden_dim=HIDDEN_DIM):
             super().__init__()
             self.state_encoder = StateEncoder(hidden_dim)
+            self.perfect_state_encoder = PerfectStateEncoder(hidden_dim)
             self.action_embed = nn.Embedding(
                 ACTION_VOCAB_SIZE + 1,
                 hidden_dim,
@@ -241,6 +282,12 @@ if nn is not None:
             )
             self.critic = nn.Sequential(
                 nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, 1),
+            )
+            self.perfect_critic = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
                 nn.LayerNorm(hidden_dim),
                 nn.GELU(),
                 nn.Linear(hidden_dim, 1),
@@ -274,7 +321,7 @@ if nn is not None:
             return self.forward(state_vec, action_ids, history_rows)
 
         def forward_actor_critic(self, state_vec, action_ids,
-                                 history_rows=None):
+                                 history_rows=None, perfect_state_vec=None):
             state_vec, action_ids, history_rows = self._normalize_inputs(
                 state_vec, action_ids, history_rows)
             batch, action_count = action_ids.shape
@@ -292,11 +339,24 @@ if nn is not None:
                 [state_expand, hist_expand, action_emb], dim=-1)
             logits = self.actor(actor_in).squeeze(-1)
 
-            value = self.critic(torch.cat([state_emb, hist_emb], dim=-1))
+            if perfect_state_vec is not None:
+                if perfect_state_vec.dim() == 1:
+                    perfect_state_vec = perfect_state_vec.unsqueeze(0)
+                perfect_emb = self.perfect_state_encoder(perfect_state_vec)
+                value = self.perfect_critic(perfect_emb)
+            else:
+                value = self.critic(torch.cat([state_emb, hist_emb], dim=-1))
             value = value.squeeze(-1)
             if batch == 1:
                 return logits.squeeze(0), value.squeeze(0)
             return logits, value
+
+        def forward_perfect_value(self, perfect_state_vec):
+            if perfect_state_vec.dim() == 1:
+                perfect_state_vec = perfect_state_vec.unsqueeze(0)
+            perfect_emb = self.perfect_state_encoder(perfect_state_vec)
+            value = self.perfect_critic(perfect_emb).squeeze(-1)
+            return value.squeeze(0) if value.shape[0] == 1 else value
 else:
     class CardPolicyNetwork:  # pragma: no cover
         def __init__(self, *args, **kwargs):

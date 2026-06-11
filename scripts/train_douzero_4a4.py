@@ -18,24 +18,40 @@ ROOT = os.path.dirname(os.path.dirname(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from douzero_4a4.rewards import seat_rewards
+from douzero_4a4.rewards import seat_rewards, team_distance_advantages
 from models.game import Game, GamePhase
 from models.hand_type import HandType, HandCategory, identify_hand
 from models.player import Player
 from models.room import LEVEL_ORDER
 from rl.actions import enumerate_legal_actions
-from rl.features import encode_action, encode_history, encode_state
-from rl.model import ACTION_PAD_ID, HISTORY_DIM, CardPolicyNetwork, torch
+from rl.features import (
+    encode_action,
+    encode_history,
+    encode_perfect_state,
+    encode_state,
+)
+from rl.model import (
+    ACTION_PAD_ID,
+    HISTORY_DIM,
+    PERFECT_STATE_DIM,
+    CardPolicyNetwork,
+    torch,
+)
 from models import ai_search
 
 
 @dataclass
 class Decision:
     state_vec: object
+    perfect_state_vec: object
     history_vec: object
     action_ids: object
     action_index: int
     seat: int
+    old_log_prob: object = None
+    old_value: object = None
+    advantage: float = 0.0
+    return_value: float = 0.0
     reward: float = 0.0
 
 
@@ -114,7 +130,7 @@ def _pad_history_tensors(items, device):
 
 
 def _select_from_actions(model, state, hand, level_rank, seat, actions,
-                         epsilon, device, train=True):
+                         epsilon, device, train=True, game=None):
     if not actions:
         return {'type': 'pass', 'indices': [], 'hand_type': None}, None, {}
 
@@ -125,27 +141,47 @@ def _select_from_actions(model, state, hand, level_rank, seat, actions,
     action_ids = torch.tensor(
         [encode_action(action, hand, level_rank) for action in actions],
         dtype=torch.long, device=device)
+    perfect_state_vec = None
+    if train and game is not None:
+        perfect_state_vec = torch.tensor(
+            encode_perfect_state(game, seat, state),
+            dtype=torch.float32, device=device)
 
     with torch.no_grad():
-        q_values = _forward_action_values(
-            model, seat, state_vec, action_ids, history_vec)
+        if train and perfect_state_vec is not None:
+            q_values, value = model.forward_actor_critic(
+                state_vec, action_ids, history_vec, perfect_state_vec)
+        else:
+            q_values = _forward_action_values(
+                model, seat, state_vec, action_ids, history_vec)
+            value = torch.tensor(0.0, dtype=torch.float32, device=device)
         greedy_idx = int(torch.argmax(q_values).item())
 
-    if train and random.random() < epsilon:
-        action_idx = random.randrange(len(actions))
-        explored = True
+    if train:
+        dist = torch.distributions.Categorical(logits=q_values)
+        sampled = dist.sample()
+        old_log_prob = dist.log_prob(sampled).detach()
+        action_idx = int(sampled.detach().cpu().item())
+        explored = action_idx != greedy_idx
     else:
         action_idx = greedy_idx
         explored = False
+        old_log_prob = None
 
     decision = None
     if train:
+        if perfect_state_vec is None:
+            perfect_state_vec = torch.zeros(
+                PERFECT_STATE_DIM, dtype=torch.float32, device=device)
         decision = Decision(
             state_vec=state_vec.detach(),
+            perfect_state_vec=perfect_state_vec.detach(),
             history_vec=history_vec.detach(),
             action_ids=action_ids.detach(),
             action_index=action_idx,
             seat=seat,
+            old_log_prob=old_log_prob,
+            old_value=value.detach(),
         )
     info = {
         'candidate_count': len(actions),
@@ -157,27 +193,58 @@ def _select_from_actions(model, state, hand, level_rank, seat, actions,
 
 
 def _select_model_action(model, state, hand, level_rank, seat, last_ht,
-                         is_free_play, epsilon, device, train=True):
+                         is_free_play, epsilon, device, train=True,
+                         game=None):
     actions = enumerate_legal_actions(
         hand, level_rank, last_ht, is_free_play)
     return _select_from_actions(
-        model, state, hand, level_rank, seat, actions, epsilon, device, train)
+        model, state, hand, level_rank, seat, actions, epsilon, device, train,
+        game=game)
 
 
 def _select_binary_action(model, state, hand, level_rank, seat, action_type,
-                          rank, epsilon, device, train=True):
+                          rank, epsilon, device, train=True, game=None):
     actions = [
         {'type': action_type, 'do': True, 'rank': rank},
         {'type': action_type, 'do': False, 'rank': rank},
     ]
     return _select_from_actions(
-        model, state, hand, level_rank, seat, actions, epsilon, device, train)
+        model, state, hand, level_rank, seat, actions, epsilon, device, train,
+        game=game)
 
 
 def _random_level(configured):
     if configured and configured != 'random':
         return configured
     return random.choice(LEVEL_ORDER)
+
+
+def _distance_advantages(game, level_rank):
+    return team_distance_advantages(game.players, level_rank)
+
+
+def _add_distance_reward(decision, before_adv, game, level_rank, args):
+    if decision is None:
+        return
+    scale = float(getattr(args, 'distance_reward_scale', 0.1))
+    if scale <= 0:
+        return
+    after_adv = _distance_advantages(game, level_rank)
+    team = decision.seat % 2
+    decision.reward += (after_adv[team] - before_adv[team]) * scale
+
+
+def _finish_gae(trajectories, gamma, gae_lambda):
+    for decisions in trajectories:
+        next_value = 0.0
+        gae = 0.0
+        for decision in reversed(decisions):
+            value = float(decision.old_value.detach().cpu().item())
+            delta = decision.reward + gamma * next_value - value
+            gae = delta + gamma * gae_lambda * gae
+            decision.advantage = gae
+            decision.return_value = gae + value
+            next_value = value
 
 
 def run_episode(model, args, device, train=True, model_team=None,
@@ -222,9 +289,11 @@ def run_episode(model, args, device, train=True, model_team=None,
             state = game.get_state(for_seat=seat)
             use_model = model_team is None or seat % 2 == model_team
             if use_model:
+                before_adv = _distance_advantages(game, level_rank)
                 action, decision, info = _select_binary_action(
                     model, state, player.hand, level_rank, seat,
-                    'cha', game.cha_rank, epsilon, device, train)
+                    'cha', game.cha_rank, epsilon, device, train,
+                    game=game)
                 if decision is not None:
                     trajectories[seat].append(decision)
                 if info:
@@ -238,7 +307,10 @@ def run_episode(model, args, device, train=True, model_team=None,
                 do_cha = _training_should_cha(game, seat)
             if not do_cha:
                 stats['cha_declines'] += 1
-            game.respond_cha(seat, do_cha)
+            result = game.respond_cha(seat, do_cha)
+            if use_model and result.get('success'):
+                _add_distance_reward(
+                    decision, before_adv, game, level_rank, args)
             continue
 
         if game.phase == GamePhase.DIAN_ASKING:
@@ -248,9 +320,11 @@ def run_episode(model, args, device, train=True, model_team=None,
             state = game.get_state(for_seat=seat)
             use_model = model_team is None or seat % 2 == model_team
             if use_model:
+                before_adv = _distance_advantages(game, level_rank)
                 action, decision, info = _select_binary_action(
                     model, state, player.hand, level_rank, seat,
-                    'dian', game.cha_rank, epsilon, device, train)
+                    'dian', game.cha_rank, epsilon, device, train,
+                    game=game)
                 if decision is not None:
                     trajectories[seat].append(decision)
                 if info:
@@ -264,7 +338,10 @@ def run_episode(model, args, device, train=True, model_team=None,
                 do_dian = _training_should_dian(game, seat)
             if not do_dian:
                 stats['dian_declines'] += 1
-            game.respond_dian(seat, do_dian)
+            result = game.respond_dian(seat, do_dian)
+            if use_model and result.get('success'):
+                _add_distance_reward(
+                    decision, before_adv, game, level_rank, args)
             continue
 
         if game.phase != GamePhase.PLAYING:
@@ -278,9 +355,11 @@ def run_episode(model, args, device, train=True, model_team=None,
         use_model = model_team is None or seat % 2 == model_team
 
         if use_model:
+            before_adv = _distance_advantages(game, level_rank)
             action, decision, info = _select_model_action(
                 model, state, player.hand, level_rank, seat, last_ht,
-                state.get('is_free_play', False), epsilon, device, train)
+                state.get('is_free_play', False), epsilon, device, train,
+                game=game)
             if decision is not None:
                 trajectories[seat].append(decision)
             if info:
@@ -317,6 +396,8 @@ def run_episode(model, args, device, train=True, model_team=None,
             stats['invalid'] += 1
             if not state.get('is_free_play', False):
                 game.player_pass(seat)
+        elif use_model:
+            _add_distance_reward(decision, before_adv, game, level_rank, args)
 
     finished = game.phase == GamePhase.ROUND_END
     rewards, reward_info = seat_rewards(
@@ -332,7 +413,13 @@ def run_episode(model, args, device, train=True, model_team=None,
     transitions = []
     for seat, decisions in enumerate(trajectories):
         for decision in decisions:
-            decision.reward = rewards[seat]
+            decision.reward += rewards[seat]
+    _finish_gae(
+        trajectories,
+        float(getattr(args, 'gae_gamma', 0.99)),
+        float(getattr(args, 'gae_lambda', 0.95)))
+    for seat, decisions in enumerate(trajectories):
+        for decision in decisions:
             transitions.append(decision)
 
     stats['finished'] += int(finished)
@@ -373,16 +460,28 @@ def dmc_update(model, optimizer, transitions, args, device):
         return {'updated': False}
     random.shuffle(transitions)
     losses = []
-    abs_errors = []
+    policy_losses = []
+    value_losses = []
+    entropies = []
+    kls = []
+    clip_fracs = []
+    value_errors = []
     q_means = []
     grad_norm = 0.0
     batches = 0
+    advantages_all = torch.tensor(
+        [item.advantage for item in transitions], dtype=torch.float32)
+    adv_mean = float(advantages_all.mean().item()) if len(transitions) else 0.0
+    adv_std = float(advantages_all.std(unbiased=False).item()) if len(transitions) else 1.0
 
     for start in range(0, len(transitions), args.batch_size):
         batch = transitions[start:start + args.batch_size]
         max_actions = max(item.action_ids.shape[0] for item in batch)
         state = torch.stack(
             [item.state_vec for item in batch]).to(device, non_blocking=True)
+        perfect_state = torch.stack(
+            [item.perfect_state_vec for item in batch]).to(
+                device, non_blocking=True)
         history = _pad_history_tensors(
             [item.history_vec for item in batch], device)
         actions = torch.full(
@@ -396,13 +495,36 @@ def dmc_update(model, optimizer, transitions, args, device):
         action_index = torch.tensor(
             [item.action_index for item in batch],
             dtype=torch.long, device=device)
-        target = torch.tensor(
-            [item.reward for item in batch],
+        old_log_prob = torch.stack([
+            item.old_log_prob.detach().reshape(())
+            for item in batch]).to(device, non_blocking=True)
+        old_value = torch.stack([
+            item.old_value.detach().reshape(())
+            for item in batch]).to(device, non_blocking=True)
+        returns = torch.tensor(
+            [item.return_value for item in batch],
             dtype=torch.float32, device=device)
+        advantages = torch.tensor(
+            [item.advantage for item in batch],
+            dtype=torch.float32, device=device)
+        advantages = (advantages - adv_mean) / max(adv_std, 1e-6)
 
-        q_values = model(state, actions, history)
-        pred = q_values.gather(1, action_index.unsqueeze(1)).squeeze(1)
-        loss = torch.nn.functional.mse_loss(pred, target)
+        logits, values = model.forward_actor_critic(
+            state, actions, history, perfect_state)
+        masked_logits = logits.masked_fill(actions == ACTION_PAD_ID, -1.0e9)
+        dist = torch.distributions.Categorical(logits=masked_logits)
+        log_prob = dist.log_prob(action_index)
+        entropy = dist.entropy().mean()
+
+        ratio = torch.exp(log_prob - old_log_prob)
+        clip_eps = float(getattr(args, 'ppo_clip', 0.2))
+        unclipped = ratio * advantages
+        clipped = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * advantages
+        policy_loss = -torch.min(unclipped, clipped).mean()
+        value_loss = torch.nn.functional.smooth_l1_loss(values, returns)
+        entropy_coef = float(getattr(args, 'entropy_coef', 0.01))
+        value_coef = float(getattr(args, 'value_loss_coef', 0.5))
+        loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
 
         optimizer.zero_grad()
         loss.backward()
@@ -413,15 +535,30 @@ def dmc_update(model, optimizer, transitions, args, device):
 
         with torch.no_grad():
             losses.append(float(loss.detach().cpu().item()))
-            abs_errors.append(float(torch.mean(torch.abs(pred - target)).cpu().item()))
-            q_means.append(float(torch.mean(pred).detach().cpu().item()))
+            policy_losses.append(float(policy_loss.detach().cpu().item()))
+            value_losses.append(float(value_loss.detach().cpu().item()))
+            entropies.append(float(entropy.detach().cpu().item()))
+            kls.append(float((old_log_prob - log_prob).mean().detach().cpu().item()))
+            clip_fracs.append(float(
+                (torch.abs(ratio - 1.0) > clip_eps).float().mean()
+                .detach().cpu().item()))
+            value_errors.append(float(
+                torch.mean(torch.abs(values - returns)).detach().cpu().item()))
+            q_means.append(float(torch.mean(values).detach().cpu().item()))
             grad_norm = float(grad_norm_tensor)
 
     return {
         'updated': True,
         'loss': sum(losses) / len(losses),
-        'abs_error': sum(abs_errors) / len(abs_errors),
+        'policy_loss': sum(policy_losses) / len(policy_losses),
+        'value_loss': sum(value_losses) / len(value_losses),
+        'entropy': sum(entropies) / len(entropies),
+        'approx_kl': sum(kls) / len(kls),
+        'clip_frac': sum(clip_fracs) / len(clip_fracs),
+        'abs_error': sum(value_errors) / len(value_errors),
         'q_mean': sum(q_means) / len(q_means),
+        'adv_mean': adv_mean,
+        'adv_std': adv_std,
         'grad_norm': grad_norm,
         'update_batches_done': batches,
     }
@@ -434,9 +571,10 @@ def save_checkpoint(model, optimizer, path, frames, episodes, args, metrics):
         'optimizer_state_dict': optimizer.state_dict(),
         'global_step': frames,
         'episode': episodes,
-        'model_type': 'shared_rope_transformer_full_action_dmc',
+        'model_type': 'shared_rope_transformer_pid_ppo',
         'backend_model_class': 'rl.model.CardPolicyNetwork',
-        'reward_version': 'terminal_team_utility_v1',
+        'reward_version': 'terminal_team_utility_plus_distance_v1',
+        'training_style': 'perfect_information_critic_ppo_gae_v1',
         'args': vars(args),
         'metrics': metrics,
     }, path)
@@ -554,6 +692,13 @@ CN_KEYS = {
     'epsilon': '探索率',
     'buffer': '缓冲区样本',
     'loss': '训练损失',
+    'policy_loss': '策略损失',
+    'value_loss': '价值损失',
+    'entropy': '策略熵',
+    'approx_kl': '近似KL',
+    'clip_frac': '裁剪比例',
+    'adv_mean': '优势均值',
+    'adv_std': '优势标准差',
     'abs_error': '平均绝对误差',
     'q_mean': '平均Q值',
     'grad_norm': '梯度范数',
@@ -602,7 +747,10 @@ CN_KEYS = {
 def _log_line(metrics):
     keys = [
         'episode', 'frames', 'fps', 'epsilon', 'buffer',
-        'loss', 'abs_error', 'q_mean', 'grad_norm',
+        'loss', 'policy_loss', 'value_loss', 'entropy',
+        'approx_kl', 'clip_frac', 'adv_mean', 'adv_std',
+        'abs_error', 'q_mean',
+        'grad_norm',
         'update_batches_done',
         'team0_reward_mean', 'terminal_utility_abs_mean',
         'finish_rate', 'full_hole_rate', 'half_hole_rate',
@@ -651,6 +799,12 @@ def main():
     parser.add_argument('--epsilon', type=float, default=0.08)
     parser.add_argument('--epsilon-eval', type=float, default=0.0)
     parser.add_argument('--max-grad-norm', type=float, default=40.0)
+    parser.add_argument('--ppo-clip', type=float, default=0.2)
+    parser.add_argument('--gae-gamma', type=float, default=0.99)
+    parser.add_argument('--gae-lambda', type=float, default=0.95)
+    parser.add_argument('--value-loss-coef', type=float, default=0.5)
+    parser.add_argument('--entropy-coef', type=float, default=0.01)
+    parser.add_argument('--distance-reward-scale', type=float, default=0.1)
     parser.add_argument('--max-episode-steps', type=int, default=700)
     parser.add_argument('--num-actors', type=int, default=1)
     parser.add_argument('--collect-episodes', type=int, default=1)
@@ -764,6 +918,13 @@ def main():
                 'epsilon': args.epsilon,
                 'buffer': len(buffer),
                 'loss': last_update.get('loss'),
+                'policy_loss': last_update.get('policy_loss'),
+                'value_loss': last_update.get('value_loss'),
+                'entropy': last_update.get('entropy'),
+                'approx_kl': last_update.get('approx_kl'),
+                'clip_frac': last_update.get('clip_frac'),
+                'adv_mean': last_update.get('adv_mean'),
+                'adv_std': last_update.get('adv_std'),
                 'abs_error': last_update.get('abs_error'),
                 'q_mean': last_update.get('q_mean'),
                 'grad_norm': last_update.get('grad_norm'),

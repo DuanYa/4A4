@@ -9,7 +9,14 @@ The public API intentionally stays small:
 """
 from models.hand_type import HandCategory
 from rl.actions import ACTION_PAD_ID, action_to_id
-from rl.model import HAND_MATRIX_SIZE, HISTORY_DIM, STATE_DIM
+from rl.model import (
+    HAND_MATRIX_SIZE,
+    HISTORY_DIM,
+    PERFECT_CONTEXT_DIM,
+    PERFECT_HAND_MATRIX_SIZE,
+    PERFECT_STATE_DIM,
+    STATE_DIM,
+)
 
 RANKS = ['3', '4', '5', '6', '7', '8', '9', '10',
          'J', 'Q', 'K', 'A', '2', 'BJ', 'RJ']
@@ -225,6 +232,86 @@ def encode_state(state, hand, level_rank, seat):
     if len(context) < STATE_DIM - HAND_MATRIX_SIZE:
         context.extend([0.0] * (STATE_DIM - HAND_MATRIX_SIZE - len(context)))
     vec.extend(context)
+    return vec
+
+
+def encode_perfect_state(game, perspective_seat, visible_state=None):
+    """Encode full training-only state with all four hands.
+
+    This mirrors PerfectDou's perfect-training/imperfect-execution idea:
+    the vector is stored only in replay transitions for the teacher loss and
+    is never required by the online policy.
+    """
+    level_rank = getattr(game, 'level_rank', '3')
+    vec = []
+    for rel in range(4):
+        seat = (perspective_seat + rel) % 4 if perspective_seat >= 0 else rel
+        player = game.players[seat]
+        vec.extend(_hand_matrix(player.hand, level_rank))
+    if len(vec) > PERFECT_HAND_MATRIX_SIZE:
+        vec = vec[:PERFECT_HAND_MATRIX_SIZE]
+    if len(vec) < PERFECT_HAND_MATRIX_SIZE:
+        vec.extend([0.0] * (PERFECT_HAND_MATRIX_SIZE - len(vec)))
+
+    state = visible_state if visible_state is not None else game.get_state(
+        for_seat=perspective_seat)
+    context = []
+    for rel in range(4):
+        seat = (perspective_seat + rel) % 4 if perspective_seat >= 0 else rel
+        player = game.players[seat]
+        _safe_append(context, player.hand_size() / 14.0)
+        _safe_append(context, 1.0 if player.finished else 0.0)
+        _safe_append(context, 1.0 if seat % 2 == perspective_seat % 2 else 0.0)
+        _safe_append(context, 1.0 if seat == perspective_seat else 0.0)
+
+    phase = state.get('phase', '') if state else ''
+    context.extend(_one_hot(phase, PHASE_ORDER))
+    last_ht = state.get('last_hand_type') if state else None
+    context.extend(_one_hot(_category_name(last_ht), CATEGORY_ORDER))
+    if last_ht:
+        _safe_append(context, last_ht.get('key_value', 0) / 20.0)
+        _safe_append(context, last_ht.get('length', 0) / 13.0)
+    else:
+        context.extend([0.0, 0.0])
+
+    _safe_append(context, perspective_seat / 3.0 if perspective_seat >= 0 else 0.0)
+    _safe_append(context, getattr(game, 'current_player_seat', -1) / 3.0)
+    _safe_append(context, getattr(game, 'last_play_seat', -1) / 3.0)
+    _safe_append(context, 1.0 if getattr(game, 'is_free_play', False) else 0.0)
+    _safe_append(context, getattr(game, 'on_stage_team', 0))
+    _safe_append(context, getattr(game, 'cha_asking_seat', -1) / 3.0)
+    _safe_append(context, getattr(game, 'dian_asking_seat', -1) / 3.0)
+    _safe_append(context, getattr(game, 'cha_player_seat', -1) / 3.0)
+    _safe_append(context, getattr(game, 'pass_count', 0) / 3.0)
+
+    played_by_rel = [[0.0] * len(RANKS) for _ in range(4)]
+    for item in getattr(game, 'play_history', []):
+        actor = item.get('seat', -1)
+        if actor < 0 or perspective_seat < 0:
+            continue
+        rel = (actor - perspective_seat) % 4
+        for card in item.get('cards', []):
+            rank = card.get('rank', '3')
+            if rank in RANKS:
+                played_by_rel[rel][_rank_index(rank)] += (
+                    1.0 / max(1, RANK_TOTALS[rank]))
+    for rel in range(4):
+        context.extend(played_by_rel[rel])
+
+    finish_signal = [0.0] * 4
+    for order, finished_seat in enumerate(getattr(game, 'finish_order', [])[:4]):
+        if perspective_seat >= 0:
+            rel = (finished_seat - perspective_seat) % 4
+            finish_signal[rel] = (4 - order) / 4.0
+    context.extend(finish_signal)
+
+    if len(context) > PERFECT_CONTEXT_DIM:
+        context = context[:PERFECT_CONTEXT_DIM]
+    if len(context) < PERFECT_CONTEXT_DIM:
+        context.extend([0.0] * (PERFECT_CONTEXT_DIM - len(context)))
+    vec.extend(context)
+    if len(vec) != PERFECT_STATE_DIM:
+        raise ValueError('perfect state dim mismatch: %d' % len(vec))
     return vec
 
 
