@@ -285,6 +285,76 @@
       min-height: 92px;
     }
 
+    .seat-body {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 154px;
+      gap: 8px;
+      padding: 10px;
+      flex: 1;
+    }
+
+    .seat-body .cards {
+      padding: 0;
+    }
+
+    .latest-action {
+      border-left: 1px solid var(--line);
+      padding-left: 8px;
+      min-width: 0;
+    }
+
+    .latest-label {
+      color: var(--muted);
+      font-size: 11px;
+      margin-bottom: 6px;
+    }
+
+    .latest-type {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      border-radius: 6px;
+      padding: 3px 7px;
+      background: #eef2f7;
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 800;
+      margin-bottom: 7px;
+    }
+
+    .latest-type.pass {
+      color: #475467;
+      background: #f2f4f7;
+      border: 1px solid #e4e7ec;
+    }
+
+    .latest-type.cha {
+      color: #7c2d12;
+      background: #ffedd5;
+      border: 1px solid #fed7aa;
+    }
+
+    .latest-type.dian {
+      color: #7f1d1d;
+      background: #fee2e2;
+      border: 1px solid #fecaca;
+    }
+
+    .latest-cards {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      min-height: 42px;
+      align-items: center;
+    }
+
+    .latest-note {
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.35;
+      margin-top: 4px;
+    }
+
     .card {
       width: 42px;
       height: 58px;
@@ -305,6 +375,16 @@
       opacity: 0.22;
       text-decoration: line-through;
     }
+
+    .card.mini {
+      width: 32px;
+      height: 44px;
+      border-radius: 5px;
+      padding: 4px 5px;
+      font-size: 11px;
+    }
+
+    .card.mini .suit { font-size: 12px; }
 
     .card .suit { font-size: 15px; }
     .card.red { color: var(--red); }
@@ -610,6 +690,41 @@
       return [seat, (seat + 1) % 4, (seat + 2) % 4, (seat + 3) % 4];
     }
 
+    function seatsBetween(startSeat, endSeat) {
+      if (!seatList().includes(startSeat) || !seatList().includes(endSeat)) return [];
+      const seats = [];
+      let seat = (startSeat + 1) % 4;
+      while (seat !== endSeat) {
+        seats.push(seat);
+        seat = (seat + 1) % 4;
+      }
+      return seats;
+    }
+
+    function latestActions(record) {
+      const latest = {};
+      if (!record) return latest;
+      let previousNonPassSeat = null;
+      for (const item of history(record).slice(0, state.stepIndex)) {
+        const seat = Number(item.seat);
+        if (!seatList().includes(seat)) continue;
+        if (item.action === 'cha' || item.action === 'dian') {
+          for (const skippedSeat of seatsBetween(previousNonPassSeat, seat)) {
+            latest[String(skippedSeat)] = {
+              seat: skippedSeat,
+              action: 'pass',
+              cards: [],
+              inferred: true,
+              reason: `${actionNames[item.action]}牌跳过`,
+            };
+          }
+        }
+        latest[String(seat)] = item;
+        if (item.action !== 'pass') previousNonPassSeat = seat;
+      }
+      return latest;
+    }
+
     function buildHands(record) {
       const hands = {};
       for (let seat = 0; seat < 4; seat += 1) {
@@ -637,6 +752,7 @@
       const classes = ['card', red ? 'red' : 'black'];
       if (isJoker) classes.push('joker');
       if (options.played) classes.push('played');
+      if (options.mini) classes.push('mini');
       const suitText = suitSymbols[suit] || suitSymbols.joker;
       return `<div class="${classes.join(' ')}"><span>${escapeHtml(rank)}</span><span class="suit">${suitText}</span></div>`;
     }
@@ -671,6 +787,7 @@
       const finishOrder = Array.isArray(record.finish_order) ? record.finish_order : [];
       const models = modelSeats(record);
       const mainSeat = state.perspectiveSeat;
+      const latest = latestActions(record);
       const center = `
         <div class="table-center">
           <strong>主视角：玩家 ${mainSeat}</strong>
@@ -695,7 +812,10 @@
               <div class="seat-title">玩家 ${seat}<small>${label}</small></div>
               <div class="seat-tags">${tags}</div>
             </div>
-            <div class="cards">${hand.map(card => renderCard(card)).join('')}</div>
+            <div class="seat-body">
+              <div class="cards">${hand.map(card => renderCard(card)).join('')}</div>
+              ${renderLatestAction(latest[String(seat)])}
+            </div>
             <div class="seat-footer">${footer}</div>
           </section>`;
       }).join('');
@@ -712,6 +832,31 @@
     function cardLine(cards) {
       if (!cards || cards.length === 0) return '<span class="empty">无出牌</span>';
       return cards.map(card => renderCard(card)).join('');
+    }
+
+    function renderLatestAction(item) {
+      if (!item) {
+        return `
+          <div class="latest-action">
+            <div class="latest-label">最近动作</div>
+            <div class="latest-note">尚无动作</div>
+          </div>`;
+      }
+      const action = item.action || 'unknown';
+      const name = actionNames[action] || action;
+      const cards = Array.isArray(item.cards) ? item.cards : [];
+      const typeClass = action === 'pass' ? 'pass' : (action === 'cha' ? 'cha' : (action === 'dian' ? 'dian' : ''));
+      const cardsHtml = cards.length
+        ? cards.map(card => renderCard(card, { mini: true })).join('')
+        : '<span class="latest-note">PASS</span>';
+      const note = item.inferred ? `<div class="latest-note">${escapeHtml(item.reason || '跳过')}</div>` : '';
+      return `
+        <div class="latest-action">
+          <div class="latest-label">最近动作</div>
+          <div class="latest-type ${typeClass}">${escapeHtml(name)}</div>
+          <div class="latest-cards">${cardsHtml}</div>
+          ${note}
+        </div>`;
     }
 
     function renderCurrent(record) {
