@@ -186,9 +186,35 @@
 
     .board {
       display: grid;
-      grid-template-columns: 1fr 1fr;
+      grid-template-columns: minmax(230px, 1fr) minmax(280px, 1.15fr) minmax(230px, 1fr);
+      grid-template-areas:
+        ". top ."
+        "left table right"
+        ". bottom .";
       gap: 12px;
       align-items: stretch;
+    }
+
+    .table-center {
+      grid-area: table;
+      border: 1px dashed var(--line);
+      border-radius: 8px;
+      background: #f8fafc;
+      color: var(--muted);
+      min-height: 132px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      text-align: center;
+      padding: 14px;
+      font-size: 13px;
+    }
+
+    .table-center strong {
+      color: var(--text);
+      font-size: 15px;
     }
 
     .seat {
@@ -199,6 +225,11 @@
       display: flex;
       flex-direction: column;
     }
+
+    .seat.pos-top { grid-area: top; }
+    .seat.pos-left { grid-area: left; }
+    .seat.pos-right { grid-area: right; }
+    .seat.pos-bottom { grid-area: bottom; }
 
     .seat-header {
       display: flex;
@@ -212,6 +243,14 @@
     .seat-title {
       font-weight: 800;
       font-size: 14px;
+    }
+
+    .seat-title small {
+      display: block;
+      margin-top: 2px;
+      color: var(--muted);
+      font-weight: 600;
+      font-size: 11px;
     }
 
     .seat-tags {
@@ -233,6 +272,7 @@
 
     .tag.team0 { color: #075985; background: #e0f2fe; border-color: #bae6fd; }
     .tag.team1 { color: #7f1d1d; background: #fee2e2; border-color: #fecaca; }
+    .tag.model { color: #6d28d9; background: #ede9fe; border-color: #ddd6fe; }
     .tag.active { color: #064e3b; background: #d1fae5; border-color: #a7f3d0; }
     .tag.finished { color: #854d0e; background: #fef3c7; border-color: #fde68a; }
 
@@ -321,6 +361,25 @@
     }
 
     .kv .k { color: var(--muted); }
+
+    .perspective-control {
+      border-top: 1px solid var(--line);
+      margin-top: 12px;
+      padding-top: 12px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .perspective-control label {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .perspective-control select {
+      min-width: 150px;
+    }
     .empty {
       color: var(--muted);
       font-size: 14px;
@@ -397,6 +456,7 @@
       records: Array.isArray(window.EMBEDDED_EVAL_RECORDS) ? window.EMBEDDED_EVAL_RECORDS : [],
       recordIndex: 0,
       stepIndex: 0,
+      perspectiveSeat: 0,
     };
 
     const el = {
@@ -477,6 +537,7 @@
       state.records = records;
       state.recordIndex = 0;
       state.stepIndex = 0;
+      state.perspectiveSeat = defaultPerspectiveSeat(currentRecord());
       hydrateRecordSelect();
       render();
     }
@@ -506,6 +567,47 @@
       const items = history(record);
       if (state.stepIndex <= 0) return null;
       return items[Math.min(state.stepIndex, items.length) - 1] || null;
+    }
+
+    function seatList() {
+      return [0, 1, 2, 3];
+    }
+
+    function modelSeats(record) {
+      if (!record || record.model_team === null || record.model_team === undefined) return seatList();
+      const team = Number(record.model_team);
+      if (!Number.isFinite(team)) return seatList();
+      return seatList().filter(seat => seat % 2 === team);
+    }
+
+    function defaultPerspectiveSeat(record) {
+      const models = modelSeats(record);
+      return models.includes(0) ? 0 : (models[0] ?? 0);
+    }
+
+    function ensurePerspectiveSeat(record) {
+      if (!record) {
+        state.perspectiveSeat = 0;
+        return;
+      }
+      if (!seatList().includes(state.perspectiveSeat)) {
+        state.perspectiveSeat = defaultPerspectiveSeat(record);
+      }
+    }
+
+    function perspectiveLayout(mainSeat) {
+      const seat = Number(mainSeat) || 0;
+      return [
+        { seat: (seat + 2) % 4, position: 'top', label: '上方' },
+        { seat: (seat + 3) % 4, position: 'left', label: '左方' },
+        { seat: (seat + 1) % 4, position: 'right', label: '右方' },
+        { seat, position: 'bottom', label: '主视角' },
+      ];
+    }
+
+    function playOrderFrom(mainSeat) {
+      const seat = Number(mainSeat) || 0;
+      return [seat, (seat + 1) % 4, (seat + 2) % 4, (seat + 3) % 4];
     }
 
     function buildHands(record) {
@@ -567,26 +669,37 @@
       const hands = buildHands(record);
       const step = currentStep(record);
       const finishOrder = Array.isArray(record.finish_order) ? record.finish_order : [];
-      el.board.innerHTML = [0, 1, 2, 3].map(seat => {
+      const models = modelSeats(record);
+      const mainSeat = state.perspectiveSeat;
+      const center = `
+        <div class="table-center">
+          <strong>主视角：玩家 ${mainSeat}</strong>
+          <div>出牌顺序：${playOrderFrom(mainSeat).map(seat => `玩家 ${seat}`).join(' → ')}</div>
+          <div>布局按主视角逆时针展开：下 → 右 → 上 → 左</div>
+        </div>`;
+      const seats = perspectiveLayout(mainSeat).map(({ seat, position, label }) => {
         const team = seat % 2;
         const hand = hands[String(seat)] || [];
         const tags = [
           `<span class="tag team${team}">队伍${team}</span>`,
+          models.includes(seat) ? '<span class="tag model">模型</span>' : '',
+          seat === mainSeat ? '<span class="tag active">主视角</span>' : '',
           seat === record.on_stage_team ? '<span class="tag active">台上</span>' : '',
           step && step.seat === seat ? '<span class="tag active">当前动作</span>' : '',
           finishOrder.includes(seat) ? `<span class="tag finished">第${finishOrder.indexOf(seat) + 1}名</span>` : '',
         ].filter(Boolean).join('');
         const footer = `剩余 ${hand.length} 张${step && step.seat === seat ? '，刚行动' : ''}`;
         return `
-          <section class="seat">
+          <section class="seat pos-${position}">
             <div class="seat-header">
-              <div class="seat-title">玩家 ${seat}</div>
+              <div class="seat-title">玩家 ${seat}<small>${label}</small></div>
               <div class="seat-tags">${tags}</div>
             </div>
             <div class="cards">${hand.map(card => renderCard(card)).join('')}</div>
             <div class="seat-footer">${footer}</div>
           </section>`;
       }).join('');
+      el.board.innerHTML = center + seats;
     }
 
     function actionTitle(item) {
@@ -607,10 +720,33 @@
         el.currentPlay.innerHTML = '<div class="empty">尚未载入记录</div>';
         return;
       }
+      const renderPerspectiveControl = () => {
+        const models = modelSeats(record);
+        const options = seatList().map(seat => {
+          const selected = seat === state.perspectiveSeat ? ' selected' : '';
+          const modelLabel = models.includes(seat) ? ' · 模型' : '';
+          return `<option value="${seat}"${selected}>玩家 ${seat}${modelLabel}</option>`;
+        }).join('');
+        return `
+          <div class="perspective-control">
+            <label for="perspectiveSelect">主视角</label>
+            <select id="perspectiveSelect">${options}</select>
+          </div>`;
+      };
+      const attachPerspectiveControl = () => {
+        const selector = document.getElementById('perspectiveSelect');
+        if (!selector) return;
+        selector.addEventListener('change', () => {
+          state.perspectiveSeat = Number(selector.value);
+          render();
+        });
+      };
       if (!item) {
         el.currentPlay.innerHTML = `
           <div class="kv"><div class="k">状态</div><div>开局初始牌</div></div>
-          <div class="play-cards"></div>`;
+          <div class="play-cards"></div>
+          ${renderPerspectiveControl()}`;
+        attachPerspectiveControl();
         return;
       }
       const ht = item.hand_type || {};
@@ -618,7 +754,9 @@
         <div class="kv"><div class="k">动作</div><div>${escapeHtml(actionTitle(item))}</div></div>
         <div class="kv"><div class="k">剩余手牌</div><div>${escapeHtml(item.hand_size_after ?? '-')}</div></div>
         <div class="kv"><div class="k">牌型参数</div><div>key=${escapeHtml(ht.key_value ?? '-')} length=${escapeHtml(ht.length ?? '-')}</div></div>
-        <div class="play-cards">${cardLine(item.cards || [])}</div>`;
+        <div class="play-cards">${cardLine(item.cards || [])}</div>
+        ${renderPerspectiveControl()}`;
+      attachPerspectiveControl();
     }
 
     function renderSummary(record) {
@@ -680,6 +818,7 @@
       const record = currentRecord();
       const max = history(record).length;
       state.stepIndex = Math.max(0, Math.min(state.stepIndex, max));
+      ensurePerspectiveSeat(record);
       renderMeta(record);
       renderBoard(record);
       renderCurrent(record);
@@ -698,6 +837,7 @@
     el.recordSelect.addEventListener('change', () => {
       state.recordIndex = Number(el.recordSelect.value);
       state.stepIndex = 0;
+      state.perspectiveSeat = defaultPerspectiveSeat(currentRecord());
       render();
     });
 
@@ -747,6 +887,7 @@
       }
     });
 
+    state.perspectiveSeat = defaultPerspectiveSeat(currentRecord());
     hydrateRecordSelect();
     render();
   </script>
