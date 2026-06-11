@@ -25,7 +25,7 @@ from models.player import Player
 from models.room import LEVEL_ORDER
 from rl.actions import enumerate_legal_actions
 from rl.features import encode_action, encode_history, encode_state
-from rl.model import CardPolicyNetwork, torch
+from rl.model import ACTION_PAD_ID, HISTORY_DIM, CardPolicyNetwork, torch
 from models import ai_search
 
 
@@ -33,7 +33,7 @@ from models import ai_search
 class Decision:
     state_vec: object
     history_vec: object
-    action_vecs: object
+    action_ids: object
     action_index: int
     seat: int
     reward: float = 0.0
@@ -94,6 +94,25 @@ def _forward_action_values(model, seat, state_vec, action_vecs, history_vec):
     return model(state_vec, action_vecs, history_vec)
 
 
+def _history_tensor(state, seat, device):
+    rows = encode_history(state, seat)
+    if not rows:
+        return torch.empty((0, HISTORY_DIM), dtype=torch.float32, device=device)
+    return torch.tensor(rows, dtype=torch.float32, device=device)
+
+
+def _pad_history_tensors(items, device):
+    max_len = max([item.shape[0] for item in items] + [1])
+    batch = torch.zeros(
+        len(items), max_len, HISTORY_DIM,
+        dtype=torch.float32, device=device)
+    batch[..., 4] = ACTION_PAD_ID
+    for row, item in enumerate(items):
+        if item.shape[0] > 0:
+            batch[row, :item.shape[0]] = item.to(device, non_blocking=True)
+    return batch
+
+
 def _select_from_actions(model, state, hand, level_rank, seat, actions,
                          epsilon, device, train=True):
     if not actions:
@@ -102,16 +121,14 @@ def _select_from_actions(model, state, hand, level_rank, seat, actions,
     state_vec = torch.tensor(
         encode_state(state, hand, level_rank, seat),
         dtype=torch.float32, device=device)
-    history_vec = torch.tensor(
-        encode_history(state, seat),
-        dtype=torch.float32, device=device)
-    action_vecs = torch.tensor(
+    history_vec = _history_tensor(state, seat, device)
+    action_ids = torch.tensor(
         [encode_action(action, hand, level_rank) for action in actions],
-        dtype=torch.float32, device=device)
+        dtype=torch.long, device=device)
 
     with torch.no_grad():
         q_values = _forward_action_values(
-            model, seat, state_vec, action_vecs, history_vec)
+            model, seat, state_vec, action_ids, history_vec)
         greedy_idx = int(torch.argmax(q_values).item())
 
     if train and random.random() < epsilon:
@@ -126,7 +143,7 @@ def _select_from_actions(model, state, hand, level_rank, seat, actions,
         decision = Decision(
             state_vec=state_vec.detach(),
             history_vec=history_vec.detach(),
-            action_vecs=action_vecs.detach(),
+            action_ids=action_ids.detach(),
             action_index=action_idx,
             seat=seat,
         )
@@ -363,18 +380,18 @@ def dmc_update(model, optimizer, transitions, args, device):
 
     for start in range(0, len(transitions), args.batch_size):
         batch = transitions[start:start + args.batch_size]
-        max_actions = max(item.action_vecs.shape[0] for item in batch)
-        action_dim = batch[0].action_vecs.shape[-1]
+        max_actions = max(item.action_ids.shape[0] for item in batch)
         state = torch.stack(
             [item.state_vec for item in batch]).to(device, non_blocking=True)
-        history = torch.stack(
-            [item.history_vec for item in batch]).to(device, non_blocking=True)
-        actions = torch.zeros(
-            len(batch), max_actions, action_dim,
-            dtype=torch.float32, device=device)
+        history = _pad_history_tensors(
+            [item.history_vec for item in batch], device)
+        actions = torch.full(
+            (len(batch), max_actions),
+            ACTION_PAD_ID,
+            dtype=torch.long, device=device)
         for row, item in enumerate(batch):
-            count = item.action_vecs.shape[0]
-            actions[row, :count] = item.action_vecs.to(
+            count = item.action_ids.shape[0]
+            actions[row, :count] = item.action_ids.to(
                 device, non_blocking=True)
         action_index = torch.tensor(
             [item.action_index for item in batch],

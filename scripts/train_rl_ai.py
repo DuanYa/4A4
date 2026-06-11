@@ -27,7 +27,7 @@ from models.player import Player
 from models.hand_type import HandType, HandCategory
 from rl.actions import enumerate_legal_actions
 from rl.features import encode_state, encode_action, encode_history
-from rl.model import CardPolicyNetwork, torch
+from rl.model import HISTORY_DIM, CardPolicyNetwork, torch
 
 
 @dataclass
@@ -65,12 +65,14 @@ def _sample_action(model, state, hand, level_rank, seat,
     state_vec = torch.tensor(
         encode_state(state, hand, level_rank, seat),
         dtype=torch.float32)
-    history_vec = torch.tensor(
-        encode_history(state, seat),
-        dtype=torch.float32)
+    history_rows = encode_history(state, seat)
+    if history_rows:
+        history_vec = torch.tensor(history_rows, dtype=torch.float32)
+    else:
+        history_vec = torch.empty((0, HISTORY_DIM), dtype=torch.float32)
     action_vecs = torch.tensor(
         [encode_action(a, hand, level_rank) for a in actions],
-        dtype=torch.float32)
+        dtype=torch.long)
 
     with torch.no_grad():
         logits, value = model.forward_actor_critic(

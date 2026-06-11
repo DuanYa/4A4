@@ -7,6 +7,138 @@
 from models.hand_type import identify_hand, can_beat, HandCategory
 from models import ai_search as search
 
+RANKS = ['3', '4', '5', '6', '7', '8', '9', '10',
+         'J', 'Q', 'K', 'A', '2', 'BJ', 'RJ']
+REGULAR_RANKS = RANKS[:13]
+STRAIGHT_RANKS = list(search.STRAIGHT_RANKS)
+
+
+def _build_action_vocab():
+    specs = []
+    specs.append(('pass',))
+
+    for rank in RANKS:
+        specs.append(('play', 'SINGLE', (rank,)))
+    for rank in REGULAR_RANKS:
+        specs.append(('play', 'PAIR', (rank, rank)))
+    for rank in REGULAR_RANKS:
+        specs.append(('play', 'BOMB3', (rank, rank, rank)))
+    for rank in REGULAR_RANKS:
+        specs.append(('play', 'BOMB4', (rank, rank, rank, rank)))
+
+    specs.append(('play', 'JOKER_BOMB', ('BJ', 'RJ')))
+    specs.append(('play', 'SI_YAO_SI', ('4', '4', 'A')))
+
+    for length in range(3, len(STRAIGHT_RANKS) + 1):
+        for start in range(0, len(STRAIGHT_RANKS) - length + 1):
+            ranks = tuple(STRAIGHT_RANKS[start:start + length])
+            specs.append(('play', 'STRAIGHT', ranks))
+
+    max_pair_count = 7
+    for pair_count in range(3, max_pair_count + 1):
+        for start in range(0, len(STRAIGHT_RANKS) - pair_count + 1):
+            ranks = []
+            for rank in STRAIGHT_RANKS[start:start + pair_count]:
+                ranks.extend([rank, rank])
+            specs.append(('play', 'DOUBLE_STRAIGHT', tuple(ranks)))
+
+    for action_type in ('cha', 'dian'):
+        for rank in REGULAR_RANKS:
+            specs.append((action_type, True, rank))
+            specs.append((action_type, False, rank))
+
+    return tuple(specs)
+
+
+ACTION_SPECS = _build_action_vocab()
+ACTION_TO_ID = {spec: idx for idx, spec in enumerate(ACTION_SPECS)}
+ACTION_VOCAB_SIZE = len(ACTION_SPECS)
+ACTION_PAD_ID = ACTION_VOCAB_SIZE
+PASS_ACTION_ID = ACTION_TO_ID[('pass',)]
+
+
+def action_spec_to_id(spec):
+    return ACTION_TO_ID[spec]
+
+
+def _rank_sort_key(rank):
+    try:
+        return RANKS.index(rank)
+    except ValueError:
+        return len(RANKS)
+
+
+def _ordered_ranks(cards, category):
+    ranks = [card.rank for card in cards]
+    if category in ('STRAIGHT', 'DOUBLE_STRAIGHT'):
+        return tuple(sorted(ranks, key=lambda rank: STRAIGHT_RANKS.index(rank)))
+    return tuple(sorted(ranks, key=_rank_sort_key))
+
+
+def action_to_spec(action, hand=None, level_rank=None):
+    action_type = action.get('type')
+    if action_type == 'pass':
+        return ('pass',)
+    if action_type in ('cha', 'dian'):
+        rank = action.get('rank') or action.get('cha_rank') or level_rank
+        if rank not in REGULAR_RANKS:
+            rank = REGULAR_RANKS[0]
+        return (action_type, bool(action.get('do')), rank)
+    if action_type != 'play':
+        raise KeyError('unsupported action type: %s' % action_type)
+
+    ht = action.get('hand_type')
+    if ht is None:
+        raise KeyError('play action is missing hand_type')
+    category = ht.category.name if hasattr(ht.category, 'name') else str(ht.category)
+    indices = action.get('indices', [])
+    if hand is None:
+        raise KeyError('hand is required for play action ids')
+    cards = [hand[i] for i in indices]
+    return ('play', category, _ordered_ranks(cards, category))
+
+
+def action_to_id(action, hand=None, level_rank=None):
+    return ACTION_TO_ID[action_to_spec(action, hand, level_rank)]
+
+
+def actions_to_ids(actions, hand, level_rank):
+    return [action_to_id(action, hand, level_rank) for action in actions]
+
+
+def action_id_to_spec(action_id):
+    if action_id < 0 or action_id >= ACTION_VOCAB_SIZE:
+        raise KeyError('invalid action id: %s' % action_id)
+    return ACTION_SPECS[action_id]
+
+
+def resolve_action_id(action_id, legal_actions, hand, level_rank):
+    """Return a legal action with concrete hand indices for an abstract id."""
+    for action in legal_actions:
+        try:
+            if action_to_id(action, hand, level_rank) == int(action_id):
+                return action
+        except KeyError:
+            continue
+    return None
+
+
+def _iter_index_groups(candidate):
+    """Yield one or more index groups from a search result."""
+    if not candidate:
+        return
+    first = candidate[0]
+    if isinstance(first, (list, tuple)):
+        for indices in candidate:
+            yield list(indices)
+    else:
+        yield list(candidate)
+
+
+def _add_candidate(target, candidate):
+    for indices in _iter_index_groups(candidate):
+        target.append(indices)
+
 
 def _make_play(hand, indices, level_rank):
     cards = [hand[i] for i in indices]
@@ -18,6 +150,16 @@ def _make_play(hand, indices, level_rank):
         'indices': list(indices),
         'hand_type': ht,
     }
+
+
+def _semantic_action_key(action, hand):
+    try:
+        return ('id', action_to_id(action, hand))
+    except KeyError:
+        action_type = action.get('type')
+        indices = sorted(action.get('indices', []))
+        ranks = tuple(sorted(hand[i].rank for i in indices))
+        return action_type, ranks
 
 
 def enumerate_legal_actions(hand, level_rank, last_ht=None,
@@ -37,7 +179,7 @@ def enumerate_legal_actions(hand, level_rank, last_ht=None,
     seen = set()
     unique = []
     for action in actions:
-        key = (action['type'], tuple(sorted(action.get('indices', []))))
+        key = _semantic_action_key(action, hand)
         if key not in seen:
             seen.add(key)
             unique.append(action)
@@ -80,9 +222,9 @@ def _free_play_actions(hand, level_rank):
                 if action:
                     actions.append(action)
 
-    for indices in (search._get_joker_bomb(proxy),
-                    search._get_si_yao_si(proxy)):
-        if indices:
+    for candidate in (search._get_joker_bomb(proxy),
+                      search._get_si_yao_si(proxy)):
+        for indices in _iter_index_groups(candidate):
             action = _make_play(hand, indices, level_rank)
             if action:
                 actions.append(action)
@@ -114,12 +256,8 @@ def _beat_actions(hand, level_rank, last_ht):
     # 炸弹类动作作为额外兜底候选
     candidate_indices.extend(search._get_n_kind(proxy, 3))
     candidate_indices.extend(search._get_n_kind(proxy, 4))
-    jk = search._get_joker_bomb(proxy)
-    if jk:
-        candidate_indices.append(jk)
-    sys = search._get_si_yao_si(proxy)
-    if sys:
-        candidate_indices.append(sys)
+    _add_candidate(candidate_indices, search._get_joker_bomb(proxy))
+    _add_candidate(candidate_indices, search._get_si_yao_si(proxy))
 
     for indices in candidate_indices:
         action = _make_play(hand, indices, level_rank)

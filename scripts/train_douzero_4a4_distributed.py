@@ -22,7 +22,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from models.room import LEVEL_ORDER
-from rl.model import CardPolicyNetwork, torch
+from rl.model import ACTION_PAD_ID, HISTORY_DIM, CardPolicyNetwork, torch
 from scripts.train_douzero_4a4 import (
     Decision,
     dmc_update,
@@ -36,21 +36,30 @@ from scripts.train_douzero_4a4 import (
 def _pack_cpu_transitions(transitions):
     if not transitions:
         return None
-    max_actions = max(item.action_vecs.shape[0] for item in transitions)
-    action_dim = transitions[0].action_vecs.shape[-1]
-    actions = torch.zeros(
-        len(transitions), max_actions, action_dim, dtype=torch.float32)
+    max_actions = max(item.action_ids.shape[0] for item in transitions)
+    actions = torch.full(
+        (len(transitions), max_actions), ACTION_PAD_ID, dtype=torch.long)
     action_counts = []
     for row, item in enumerate(transitions):
-        count = item.action_vecs.shape[0]
-        actions[row, :count] = item.action_vecs.detach().cpu()
+        count = item.action_ids.shape[0]
+        actions[row, :count] = item.action_ids.detach().cpu()
         action_counts.append(count)
+    max_history = max([item.history_vec.shape[0] for item in transitions] + [1])
+    history = torch.zeros(
+        len(transitions), max_history, HISTORY_DIM, dtype=torch.float32)
+    history[..., 4] = ACTION_PAD_ID
+    history_counts = []
+    for row, item in enumerate(transitions):
+        count = item.history_vec.shape[0]
+        if count > 0:
+            history[row, :count] = item.history_vec.detach().cpu()
+        history_counts.append(count)
     return {
         'state_vecs': torch.stack(
             [item.state_vec.detach().cpu() for item in transitions]).numpy(),
-        'history_vecs': torch.stack(
-            [item.history_vec.detach().cpu() for item in transitions]).numpy(),
-        'action_vecs': actions.numpy(),
+        'history_vecs': history.numpy(),
+        'history_counts': history_counts,
+        'action_ids': actions.numpy(),
         'action_counts': action_counts,
         'action_indices': [item.action_index for item in transitions],
         'seats': [item.seat for item in transitions],
@@ -63,13 +72,14 @@ def _from_packed_transitions(items):
         return []
     state_vecs = torch.from_numpy(items['state_vecs']).float()
     history_vecs = torch.from_numpy(items['history_vecs']).float()
-    action_vecs = torch.from_numpy(items['action_vecs']).float()
+    action_ids = torch.from_numpy(items['action_ids']).long()
     decisions = []
     for row, count in enumerate(items['action_counts']):
+        history_count = items.get('history_counts', [history_vecs.shape[1]])[row]
         decisions.append(Decision(
             state_vec=state_vecs[row],
-            history_vec=history_vecs[row],
-            action_vecs=action_vecs[row, :count],
+            history_vec=history_vecs[row, :history_count],
+            action_ids=action_ids[row, :count],
             action_index=items['action_indices'][row],
             seat=items['seats'][row],
             reward=items['rewards'][row],

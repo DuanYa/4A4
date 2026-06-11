@@ -1,9 +1,8 @@
-"""
-History-aware neural policy/value model for 4A4.
+"""History-aware action-id policy/value model for 4A4.
 
-The backend loads this class directly, so the training code keeps the online
-checkpoint compatible by saving `model_state_dict` for CardPolicyNetwork.
-History uses RoPE rotary position encoding and masks zero padding rows.
+The model keeps the backend-facing class name `CardPolicyNetwork`, but its
+candidate-action input is now a tensor of global action ids. It still returns
+one score per currently legal action, so no global action mask is needed.
 """
 try:
     import math
@@ -14,23 +13,28 @@ except ImportError:  # Allow rule AI to run on machines without torch.
     torch = None
     nn = None
 
-STATE_DIM = 224
-ACTION_DIM = 72
-HISTORY_DIM = 96
-HISTORY_LEN = 80
+from rl.actions import ACTION_PAD_ID, ACTION_VOCAB_SIZE
+
+RANK_COUNT = 15
+HAND_CHANNELS = 5
+HAND_MATRIX_SIZE = HAND_CHANNELS * RANK_COUNT
+STATE_CONTEXT_DIM = 194
+STATE_DIM = HAND_MATRIX_SIZE + STATE_CONTEXT_DIM
+HISTORY_DIM = 5
 HIDDEN_DIM = 512
 HISTORY_LAYERS = 4
 
 
 if nn is not None:
-    def history_padding_mask(history_vecs):
-        """Return True for padded history rows.
-
-        Padding rows are all-zero vectors produced by `encode_history`.
-        Completely empty histories are safe: attention is allowed to run, but
-        masked pooling below turns the final history embedding into zeros.
-        """
-        return history_vecs.abs().sum(dim=-1) <= 1e-8
+    def history_padding_mask(history_rows):
+        if history_rows.numel() == 0:
+            return torch.ones(
+                history_rows.shape[:-1],
+                dtype=torch.bool,
+                device=history_rows.device)
+        rel_empty = history_rows[..., :4].abs().sum(dim=-1) <= 1e-8
+        ids = history_rows[..., 4].long()
+        return rel_empty & (ids == ACTION_PAD_ID)
 
 
     def _apply_rope(x):
@@ -121,107 +125,164 @@ if nn is not None:
             return x
 
 
+    class StateEncoder(nn.Module):
+        def __init__(self, hidden_dim=HIDDEN_DIM):
+            super().__init__()
+            self.hand_conv = nn.Sequential(
+                nn.Conv1d(HAND_CHANNELS, 64, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv1d(64, 64, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Flatten(),
+                nn.Linear(64 * RANK_COUNT, hidden_dim // 2),
+                nn.LayerNorm(hidden_dim // 2),
+                nn.GELU(),
+            )
+            self.context_mlp = nn.Sequential(
+                nn.Linear(STATE_CONTEXT_DIM, hidden_dim // 2),
+                nn.LayerNorm(hidden_dim // 2),
+                nn.GELU(),
+                nn.Linear(hidden_dim // 2, hidden_dim // 2),
+                nn.GELU(),
+            )
+            self.out = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+            )
+
+        def forward(self, state_vec):
+            hand = state_vec[:, :HAND_MATRIX_SIZE].view(
+                -1, HAND_CHANNELS, RANK_COUNT)
+            context = state_vec[:, HAND_MATRIX_SIZE:]
+            return self.out(torch.cat([
+                self.hand_conv(hand),
+                self.context_mlp(context),
+            ], dim=-1))
+
+
     class RotaryHistoryEncoder(nn.Module):
-        def __init__(self, history_dim=HISTORY_DIM, hidden_dim=HIDDEN_DIM,
+        def __init__(self, action_embed, hidden_dim=HIDDEN_DIM,
                      nhead=8, num_layers=2, dropout=0.1):
             super().__init__()
-            self.proj = nn.Linear(history_dim, hidden_dim)
+            self.action_embed = action_embed
+            self.input_proj = nn.Sequential(
+                nn.Linear(hidden_dim + 4, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+            )
             self.layers = nn.ModuleList([
                 RotaryTransformerBlock(hidden_dim, nhead, dropout)
                 for _ in range(num_layers)
             ])
             self.out_norm = nn.LayerNorm(hidden_dim)
 
-        def forward(self, history_vecs):
-            if history_vecs.dim() == 2:
-                history_vecs = history_vecs.unsqueeze(0)
-            padding_mask = history_padding_mask(history_vecs)
-            valid = (~padding_mask).to(history_vecs.dtype)
-            x = self.proj(history_vecs)
+        def forward(self, history_rows):
+            if history_rows.dim() == 2:
+                history_rows = history_rows.unsqueeze(0)
+            if history_rows.shape[1] == 0:
+                pad = torch.zeros(
+                    history_rows.shape[0], 1, HISTORY_DIM,
+                    dtype=history_rows.dtype,
+                    device=history_rows.device)
+                pad[..., 4] = ACTION_PAD_ID
+                history_rows = pad
+
+            padding_mask = history_padding_mask(history_rows)
+            rel = history_rows[..., :4].to(dtype=torch.float32)
+            action_ids = history_rows[..., 4].long().clamp(
+                min=0, max=ACTION_PAD_ID)
+            action_emb = self.action_embed(action_ids)
+            x = self.input_proj(torch.cat([rel, action_emb], dim=-1))
             for layer in self.layers:
                 x = layer(x, padding_mask)
             x = self.out_norm(x)
             x = x.masked_fill(padding_mask.unsqueeze(-1), 0.0)
-            denom = valid.sum(dim=1, keepdim=True).clamp_min(1.0)
-            pooled = x.sum(dim=1) / denom
-            return pooled
+
+            valid_counts = (~padding_mask).long().sum(dim=1)
+            last_idx = (valid_counts - 1).clamp_min(0)
+            batch_idx = torch.arange(x.shape[0], device=x.device)
+            last = x[batch_idx, last_idx]
+            empty = valid_counts == 0
+            if empty.any():
+                last = last.clone()
+                last[empty] = 0.0
+            return last
 
 
     class CardPolicyNetwork(nn.Module):
-        """Shared symmetric Transformer Q/Actor-Critic model."""
+        """Shared symmetric RoPE Transformer model with action embeddings."""
 
         def __init__(self, state_dim=STATE_DIM,
-                     action_dim=ACTION_DIM,
+                     action_dim=ACTION_VOCAB_SIZE,
                      history_dim=HISTORY_DIM,
                      hidden_dim=HIDDEN_DIM):
             super().__init__()
-            self.state_encoder = nn.Sequential(
-                nn.Linear(state_dim, hidden_dim),
-                nn.LayerNorm(hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
+            self.state_encoder = StateEncoder(hidden_dim)
+            self.action_embed = nn.Embedding(
+                ACTION_VOCAB_SIZE + 1,
+                hidden_dim,
+                padding_idx=ACTION_PAD_ID,
             )
             self.history_encoder = RotaryHistoryEncoder(
-                history_dim=history_dim,
+                self.action_embed,
                 hidden_dim=hidden_dim,
                 nhead=8,
                 num_layers=HISTORY_LAYERS,
                 dropout=0.1,
             )
-            self.action_encoder = nn.Sequential(
-                nn.Linear(action_dim, hidden_dim),
-                nn.LayerNorm(hidden_dim),
-                nn.ReLU(),
-            )
             self.actor = nn.Sequential(
                 nn.Linear(hidden_dim * 3, hidden_dim),
                 nn.LayerNorm(hidden_dim),
-                nn.ReLU(),
+                nn.GELU(),
                 nn.Linear(hidden_dim, hidden_dim // 2),
-                nn.ReLU(),
+                nn.GELU(),
                 nn.Linear(hidden_dim // 2, 1),
             )
             self.critic = nn.Sequential(
                 nn.Linear(hidden_dim * 2, hidden_dim),
                 nn.LayerNorm(hidden_dim),
-                nn.ReLU(),
+                nn.GELU(),
                 nn.Linear(hidden_dim, 1),
             )
 
-        def _normalize_inputs(self, state_vec, action_vecs,
-                              history_vecs=None):
+        def _normalize_inputs(self, state_vec, action_ids, history_rows=None):
             if state_vec.dim() == 1:
                 state_vec = state_vec.unsqueeze(0)
-            if action_vecs.dim() == 2:
-                action_vecs = action_vecs.unsqueeze(0)
-            if history_vecs is None:
-                history_vecs = torch.zeros(
-                    state_vec.shape[0], HISTORY_LEN, HISTORY_DIM,
-                    dtype=state_vec.dtype, device=state_vec.device)
-            elif history_vecs.dim() == 2:
-                history_vecs = history_vecs.unsqueeze(0)
-            return state_vec, action_vecs, history_vecs
+            if action_ids.dim() == 1:
+                action_ids = action_ids.unsqueeze(0)
+            action_ids = action_ids.long()
+            if history_rows is None:
+                history_rows = torch.zeros(
+                    state_vec.shape[0], 1, HISTORY_DIM,
+                    dtype=state_vec.dtype,
+                    device=state_vec.device)
+                history_rows[..., 4] = ACTION_PAD_ID
+            elif history_rows.dim() == 1:
+                history_rows = history_rows.view(1, 0, HISTORY_DIM)
+            elif history_rows.dim() == 2:
+                history_rows = history_rows.unsqueeze(0)
+            return state_vec, action_ids, history_rows
 
-        def forward(self, state_vec, action_vecs, history_vecs=None):
+        def forward(self, state_vec, action_ids, history_rows=None):
             logits, _ = self.forward_actor_critic(
-                state_vec, action_vecs, history_vecs)
+                state_vec, action_ids, history_rows)
             return logits
 
-        def forward_for_seat(self, seat, state_vec, action_vecs,
-                             history_vecs=None):
-            # The observation is already encoded from `seat`'s perspective.
-            return self.forward(state_vec, action_vecs, history_vecs)
+        def forward_for_seat(self, seat, state_vec, action_ids,
+                             history_rows=None):
+            return self.forward(state_vec, action_ids, history_rows)
 
-        def forward_actor_critic(self, state_vec, action_vecs,
-                                 history_vecs=None):
-            state_vec, action_vecs, history_vecs = self._normalize_inputs(
-                state_vec, action_vecs, history_vecs)
-            batch, action_count, _ = action_vecs.shape
+        def forward_actor_critic(self, state_vec, action_ids,
+                                 history_rows=None):
+            state_vec, action_ids, history_rows = self._normalize_inputs(
+                state_vec, action_ids, history_rows)
+            batch, action_count = action_ids.shape
 
             state_emb = self.state_encoder(state_vec)
-            hist_emb = self.history_encoder(history_vecs)
-            action_emb = self.action_encoder(action_vecs)
+            hist_emb = self.history_encoder(history_rows)
+            action_emb = self.action_embed(action_ids.clamp(
+                min=0, max=ACTION_PAD_ID))
 
             state_expand = state_emb.unsqueeze(1).expand(
                 batch, action_count, state_emb.shape[-1])
@@ -239,4 +300,4 @@ if nn is not None:
 else:
     class CardPolicyNetwork:  # pragma: no cover
         def __init__(self, *args, **kwargs):
-            raise ImportError('深度学习AI需要先安装 torch')
+            raise ImportError('deep-learning AI requires torch')

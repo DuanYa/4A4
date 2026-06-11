@@ -8,10 +8,17 @@
 4. 选择分数最高动作；
 5. 若模型不可用或推理失败，自动回退到规则AI，保证线上AI稳定。
 """
-from rl.actions import enumerate_legal_actions
+from rl.actions import enumerate_legal_actions, resolve_action_id
 from rl.features import encode_state, encode_action, encode_history
 from rl.model_store import get_shared_model, DEFAULT_MODEL_NAME
-from rl.model import torch
+from rl.model import HISTORY_DIM, torch
+
+
+def _history_tensor(state, seat):
+    rows = encode_history(state, seat)
+    if not rows:
+        return torch.empty((0, HISTORY_DIM), dtype=torch.float32)
+    return torch.tensor(rows, dtype=torch.float32)
 
 
 class NeuralPolicy:
@@ -36,16 +43,18 @@ class NeuralPolicy:
             state_vec = torch.tensor(
                 encode_state(state, hand, level_rank, seat),
                 dtype=torch.float32)
-            action_vecs = torch.tensor(
+            action_ids = torch.tensor(
                 [encode_action(a, hand, level_rank) for a in actions],
-                dtype=torch.float32)
-            history_vecs = torch.tensor(
-                encode_history(state, seat),
-                dtype=torch.float32)
+                dtype=torch.long)
+            history_vecs = _history_tensor(state, seat)
             with torch.no_grad():
-                scores = self.model(state_vec, action_vecs, history_vecs)
+                scores = self.model(state_vec, action_ids, history_vecs)
             best_idx = int(torch.argmax(scores).item())
-            best_action = actions[best_idx]
+            best_action_id = int(action_ids[best_idx].item())
+            best_action = resolve_action_id(
+                best_action_id, actions, hand, level_rank)
+            if best_action is None:
+                best_action = actions[best_idx]
             if best_action['type'] == 'pass':
                 return None
             return best_action.get('indices', [])
@@ -69,14 +78,12 @@ class NeuralPolicy:
             state_vec = torch.tensor(
                 encode_state(state, hand, level_rank, seat),
                 dtype=torch.float32)
-            action_vecs = torch.tensor(
+            action_ids = torch.tensor(
                 [encode_action(a, hand, level_rank) for a in actions],
-                dtype=torch.float32)
-            history_vecs = torch.tensor(
-                encode_history(state, seat),
-                dtype=torch.float32)
+                dtype=torch.long)
+            history_vecs = _history_tensor(state, seat)
             with torch.no_grad():
-                scores = self.model(state_vec, action_vecs, history_vecs)
+                scores = self.model(state_vec, action_ids, history_vecs)
             best_idx = int(torch.argmax(scores).item())
             return bool(actions[best_idx]['do'])
         except Exception:
