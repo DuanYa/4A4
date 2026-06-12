@@ -25,6 +25,7 @@ from models.room import LEVEL_ORDER
 from rl.model import ACTION_PAD_ID, HISTORY_DIM, CardPolicyNetwork, torch
 from scripts.train_douzero_4a4 import (
     Decision,
+    _load_resume,
     dmc_update,
     evaluate,
     save_checkpoint,
@@ -345,6 +346,7 @@ def main():
                         choices=['random'] + LEVEL_ORDER)
     parser.add_argument('--save', default=os.path.join(
         ROOT, 'checkpoints', 'douzero_4a4_distributed_100x.pt'))
+    parser.add_argument('--resume', default='')
     parser.add_argument('--checkpoint-every', type=int, default=1000000)
     parser.add_argument('--eval-every', type=int, default=5000000)
     parser.add_argument('--eval-episodes', type=int, default=256)
@@ -376,6 +378,11 @@ def main():
     optimizer = torch.optim.RMSprop(
         model.parameters(), lr=args.lr, momentum=0.0, eps=1e-5,
         alpha=0.99)
+    frames, episodes = _load_resume(
+        model, optimizer, args.resume, learner_device)
+    if args.resume and frames > 0:
+        print('已从checkpoint恢复=%s 样本步数=%d 局数=%d' % (
+            args.resume, frames, episodes), flush=True)
 
     run_dir = os.path.join(ROOT, 'runtime', 'douzero_4a4_distributed')
     os.makedirs(run_dir, exist_ok=True)
@@ -401,18 +408,24 @@ def main():
             actors.append(proc)
             actor_id += 1
 
-    frames = 0
-    episodes = 0
     since_update = 0
-    next_log = args.log_every if args.log_every > 0 else None
-    next_eval = args.eval_every if args.eval_every > 0 else None
+    next_log = (
+        ((frames // args.log_every) + 1) * args.log_every
+        if args.log_every > 0 else None)
+    next_eval = (
+        ((frames // args.eval_every) + 1) * args.eval_every
+        if args.eval_every > 0 else None)
     next_checkpoint = (
-        args.checkpoint_every if args.checkpoint_every > 0 else None)
+        ((frames // args.checkpoint_every) + 1) * args.checkpoint_every
+        if args.checkpoint_every > 0 else None)
     next_publish = (
-        args.weight_publish_every if args.weight_publish_every > 0 else None)
+        ((frames // args.weight_publish_every) + 1)
+        * args.weight_publish_every
+        if args.weight_publish_every > 0 else None)
     recent = Counter()
     last_update = {'updated': False}
     start = time.time()
+    start_frames = frames
 
     try:
         while frames < args.frames:
@@ -466,7 +479,7 @@ def main():
                 metrics.update({
                     'frames': frames,
                     'episodes': episodes,
-                    'fps': frames / elapsed,
+                    'fps': max(0, frames - start_frames) / elapsed,
                     'replay': len(replay),
                     'queue': queue.qsize() if hasattr(queue, 'qsize') else -1,
                     'loss': last_update.get('loss'),
