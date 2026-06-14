@@ -158,7 +158,13 @@ def _select_from_actions(model, state, hand, level_rank, seat, actions,
         greedy_idx = int(torch.argmax(q_values).item())
 
     if train:
-        dist = torch.distributions.Categorical(logits=q_values)
+        eps = max(0.0, min(1.0, float(epsilon)))
+        if eps > 0.0:
+            probs = torch.softmax(q_values, dim=0)
+            behavior_probs = probs * (1.0 - eps) + eps / len(actions)
+            dist = torch.distributions.Categorical(probs=behavior_probs)
+        else:
+            dist = torch.distributions.Categorical(logits=q_values)
         sampled = dist.sample()
         old_log_prob = dist.log_prob(sampled).detach()
         action_idx = int(sampled.detach().cpu().item())
@@ -455,10 +461,9 @@ def run_episode(model, args, device, train=True, model_team=None,
     return transitions, stats
 
 
-def dmc_update(model, optimizer, transitions, args, device):
+def ppo_update(model, optimizer, transitions, args, device):
     if not transitions:
         return {'updated': False}
-    random.shuffle(transitions)
     losses = []
     policy_losses = []
     value_losses = []
@@ -473,79 +478,81 @@ def dmc_update(model, optimizer, transitions, args, device):
         [item.advantage for item in transitions], dtype=torch.float32)
     adv_mean = float(advantages_all.mean().item()) if len(transitions) else 0.0
     adv_std = float(advantages_all.std(unbiased=False).item()) if len(transitions) else 1.0
+    epochs = max(1, int(getattr(args, 'ppo_epochs', 1)))
 
-    for start in range(0, len(transitions), args.batch_size):
-        batch = transitions[start:start + args.batch_size]
-        max_actions = max(item.action_ids.shape[0] for item in batch)
-        state = torch.stack(
-            [item.state_vec for item in batch]).to(device, non_blocking=True)
-        perfect_state = torch.stack(
-            [item.perfect_state_vec for item in batch]).to(
-                device, non_blocking=True)
-        history = _pad_history_tensors(
-            [item.history_vec for item in batch], device)
-        actions = torch.full(
-            (len(batch), max_actions),
-            ACTION_PAD_ID,
-            dtype=torch.long, device=device)
-        for row, item in enumerate(batch):
-            count = item.action_ids.shape[0]
-            actions[row, :count] = item.action_ids.to(
-                device, non_blocking=True)
-        action_index = torch.tensor(
-            [item.action_index for item in batch],
-            dtype=torch.long, device=device)
-        old_log_prob = torch.stack([
-            item.old_log_prob.detach().reshape(())
-            for item in batch]).to(device, non_blocking=True)
-        old_value = torch.stack([
-            item.old_value.detach().reshape(())
-            for item in batch]).to(device, non_blocking=True)
-        returns = torch.tensor(
-            [item.return_value for item in batch],
-            dtype=torch.float32, device=device)
-        advantages = torch.tensor(
-            [item.advantage for item in batch],
-            dtype=torch.float32, device=device)
-        advantages = (advantages - adv_mean) / max(adv_std, 1e-6)
+    for _ in range(epochs):
+        random.shuffle(transitions)
+        for start in range(0, len(transitions), args.batch_size):
+            batch = transitions[start:start + args.batch_size]
+            max_actions = max(item.action_ids.shape[0] for item in batch)
+            state = torch.stack(
+                [item.state_vec for item in batch]).to(device, non_blocking=True)
+            perfect_state = torch.stack(
+                [item.perfect_state_vec for item in batch]).to(
+                    device, non_blocking=True)
+            history = _pad_history_tensors(
+                [item.history_vec for item in batch], device)
+            actions = torch.full(
+                (len(batch), max_actions),
+                ACTION_PAD_ID,
+                dtype=torch.long, device=device)
+            for row, item in enumerate(batch):
+                count = item.action_ids.shape[0]
+                actions[row, :count] = item.action_ids.to(
+                    device, non_blocking=True)
+            action_index = torch.tensor(
+                [item.action_index for item in batch],
+                dtype=torch.long, device=device)
+            old_log_prob = torch.stack([
+                item.old_log_prob.detach().reshape(())
+                for item in batch]).to(device, non_blocking=True)
+            returns = torch.tensor(
+                [item.return_value for item in batch],
+                dtype=torch.float32, device=device)
+            advantages = torch.tensor(
+                [item.advantage for item in batch],
+                dtype=torch.float32, device=device)
+            advantages = (advantages - adv_mean) / max(adv_std, 1e-6)
 
-        logits, values = model.forward_actor_critic(
-            state, actions, history, perfect_state)
-        masked_logits = logits.masked_fill(actions == ACTION_PAD_ID, -1.0e9)
-        dist = torch.distributions.Categorical(logits=masked_logits)
-        log_prob = dist.log_prob(action_index)
-        entropy = dist.entropy().mean()
+            logits, values = model.forward_actor_critic(
+                state, actions, history, perfect_state)
+            masked_logits = logits.masked_fill(actions == ACTION_PAD_ID, -1.0e9)
+            dist = torch.distributions.Categorical(logits=masked_logits)
+            log_prob = dist.log_prob(action_index)
+            entropy = dist.entropy().mean()
 
-        ratio = torch.exp(log_prob - old_log_prob)
-        clip_eps = float(getattr(args, 'ppo_clip', 0.2))
-        unclipped = ratio * advantages
-        clipped = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * advantages
-        policy_loss = -torch.min(unclipped, clipped).mean()
-        value_loss = torch.nn.functional.smooth_l1_loss(values, returns)
-        entropy_coef = float(getattr(args, 'entropy_coef', 0.01))
-        value_coef = float(getattr(args, 'value_loss_coef', 0.5))
-        loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
+            ratio = torch.exp(log_prob - old_log_prob)
+            clip_eps = float(getattr(args, 'ppo_clip', 0.2))
+            unclipped = ratio * advantages
+            clipped = torch.clamp(
+                ratio, 1.0 - clip_eps, 1.0 + clip_eps) * advantages
+            policy_loss = -torch.min(unclipped, clipped).mean()
+            value_loss = torch.nn.functional.smooth_l1_loss(values, returns)
+            entropy_coef = float(getattr(args, 'entropy_coef', 0.01))
+            value_coef = float(getattr(args, 'value_loss_coef', 0.5))
+            loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
 
-        optimizer.zero_grad()
-        loss.backward()
-        grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
-            model.parameters(), args.max_grad_norm)
-        optimizer.step()
-        batches += 1
+            optimizer.zero_grad()
+            loss.backward()
+            grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), args.max_grad_norm)
+            optimizer.step()
+            batches += 1
 
-        with torch.no_grad():
-            losses.append(float(loss.detach().cpu().item()))
-            policy_losses.append(float(policy_loss.detach().cpu().item()))
-            value_losses.append(float(value_loss.detach().cpu().item()))
-            entropies.append(float(entropy.detach().cpu().item()))
-            kls.append(float((old_log_prob - log_prob).mean().detach().cpu().item()))
-            clip_fracs.append(float(
-                (torch.abs(ratio - 1.0) > clip_eps).float().mean()
-                .detach().cpu().item()))
-            value_errors.append(float(
-                torch.mean(torch.abs(values - returns)).detach().cpu().item()))
-            q_means.append(float(torch.mean(values).detach().cpu().item()))
-            grad_norm = float(grad_norm_tensor)
+            with torch.no_grad():
+                losses.append(float(loss.detach().cpu().item()))
+                policy_losses.append(float(policy_loss.detach().cpu().item()))
+                value_losses.append(float(value_loss.detach().cpu().item()))
+                entropies.append(float(entropy.detach().cpu().item()))
+                kls.append(float(
+                    (old_log_prob - log_prob).mean().detach().cpu().item()))
+                clip_fracs.append(float(
+                    (torch.abs(ratio - 1.0) > clip_eps).float().mean()
+                    .detach().cpu().item()))
+                value_errors.append(float(
+                    torch.mean(torch.abs(values - returns)).detach().cpu().item()))
+                q_means.append(float(torch.mean(values).detach().cpu().item()))
+                grad_norm = float(grad_norm_tensor)
 
     return {
         'updated': True,
@@ -561,7 +568,11 @@ def dmc_update(model, optimizer, transitions, args, device):
         'adv_std': adv_std,
         'grad_norm': grad_norm,
         'update_batches_done': batches,
+        'update_epochs_done': epochs,
     }
+
+
+dmc_update = ppo_update
 
 
 def save_checkpoint(model, optimizer, path, frames, episodes, args, metrics):
@@ -800,6 +811,7 @@ def main():
     parser.add_argument('--epsilon-eval', type=float, default=0.0)
     parser.add_argument('--max-grad-norm', type=float, default=40.0)
     parser.add_argument('--ppo-clip', type=float, default=0.2)
+    parser.add_argument('--ppo-epochs', type=int, default=2)
     parser.add_argument('--gae-gamma', type=float, default=0.99)
     parser.add_argument('--gae-lambda', type=float, default=0.95)
     parser.add_argument('--value-loss-coef', type=float, default=0.5)

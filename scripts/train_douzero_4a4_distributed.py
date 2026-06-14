@@ -1,10 +1,10 @@
 """Distributed actor-learner trainer for DouZero-4A4.
 
-This script keeps one shared learner/replay buffer and runs many independent
-actor processes. Actors refresh the latest shared Transformer weights, collect
-complete 4A4 episodes, and push CPU transitions into a multiprocessing queue.
-The learner trains the same backend-compatible CardPolicyNetwork that will be
-served online.
+This script keeps one shared learner and runs many independent actor processes.
+Actors refresh the latest shared Transformer weights, collect complete 4A4
+episodes, and push CPU transitions into a multiprocessing queue. The learner
+updates on the most recent on-policy rollout and then clears that rollout,
+keeping PPO closer to its intended data flow.
 """
 import argparse
 import json
@@ -12,7 +12,7 @@ import os
 import random
 import sys
 import time
-from collections import Counter, deque
+from collections import Counter
 from multiprocessing import Event, Process, Queue, set_start_method
 from queue import Empty
 from types import SimpleNamespace
@@ -26,8 +26,8 @@ from rl.model import ACTION_PAD_ID, HISTORY_DIM, CardPolicyNetwork, torch
 from scripts.train_douzero_4a4 import (
     Decision,
     _load_resume,
-    dmc_update,
     evaluate,
+    ppo_update,
     save_checkpoint,
     run_episode,
     write_eval_records,
@@ -154,9 +154,18 @@ def actor_loop(actor_id, device_name, args_dict, weight_path, out_queue,
         last_mtime = _safe_load_model(
             model, weight_path, device, last_mtime)
         try:
+            model_team = None
+            if random.random() < float(getattr(args, 'rule_opponent_rate', 0.0)):
+                model_team = random.randrange(2)
             with torch.no_grad():
                 transitions, stats = run_episode(
-                    model, local_args, device, train=True)
+                    model, local_args, device, train=True,
+                    model_team=model_team)
+            if model_team is None:
+                stats['self_play_episodes'] += 1
+            else:
+                stats['rule_opponent_episodes'] += 1
+                stats['train_model_team_%d' % model_team] += 1
             out_queue.put((
                 actor_id, _pack_cpu_transitions(transitions), dict(stats)))
             episodes += 1
@@ -201,7 +210,8 @@ CN_KEYS = {
     'frames': '样本步数',
     'episodes': '局数',
     'fps': '每秒样本',
-    'replay': '回放池样本',
+    'replay': '旧回放池样本',
+    'rollout': 'on-policy样本',
     'queue': '采样队列',
     'loss': '训练损失',
     'policy_loss': '策略损失',
@@ -255,12 +265,14 @@ CN_KEYS = {
     'eval_half_hole_rate': '评估半洞率',
     'eval_truncated_rate': '评估截断率',
     'eval_invalid': '评估非法动作数',
+    'self_play_rate': '自博弈训练占比',
+    'rule_opponent_rate_seen': '规则对手训练占比',
 }
 
 
 def _log(metrics):
     keys = [
-        'frames', 'episodes', 'fps', 'replay', 'queue',
+        'frames', 'episodes', 'fps', 'rollout', 'replay', 'queue',
         'loss', 'policy_loss', 'value_loss', 'entropy',
         'approx_kl', 'clip_frac', 'adv_mean', 'adv_std',
         'abs_error', 'q_mean',
@@ -271,6 +283,7 @@ def _log(metrics):
         'team0_win_rate', 'team1_win_rate',
         'team0_full_hole_rate', 'team0_half_hole_rate',
         'team1_full_hole_rate', 'team1_half_hole_rate',
+        'self_play_rate', 'rule_opponent_rate_seen',
         'invalid', 'actor_errors', 'queue_timeouts',
         'avg_candidates', 'avg_selected_q', 'avg_greedy_q', 'avg_q_gap',
         'plays', 'passes', 'pass_rate', 'explore_actions', 'explore_rate',
@@ -310,6 +323,9 @@ def _aggregate_rates(recent):
         'team0_half_hole_rate': recent['team0_ban_dong'] / episodes,
         'team1_full_hole_rate': recent['team1_quan_dong'] / episodes,
         'team1_half_hole_rate': recent['team1_ban_dong'] / episodes,
+        'self_play_rate': recent['self_play_episodes'] / episodes,
+        'rule_opponent_rate_seen': (
+            recent['rule_opponent_episodes'] / episodes),
         'avg_candidates': (
             recent['avg_candidates_x1000'] / episodes / 1000.0),
         'avg_selected_q': (
@@ -336,6 +352,7 @@ def main():
     parser.add_argument('--epsilon-eval', type=float, default=0.0)
     parser.add_argument('--max-grad-norm', type=float, default=40.0)
     parser.add_argument('--ppo-clip', type=float, default=0.2)
+    parser.add_argument('--ppo-epochs', type=int, default=2)
     parser.add_argument('--gae-gamma', type=float, default=0.99)
     parser.add_argument('--gae-lambda', type=float, default=0.95)
     parser.add_argument('--value-loss-coef', type=float, default=0.5)
@@ -358,6 +375,7 @@ def main():
         ROOT, 'logs', 'douzero_4a4_distributed_100x_metrics.jsonl'))
     parser.add_argument('--weight-publish-every', type=int, default=50000)
     parser.add_argument('--actor-refresh-episodes', type=int, default=20)
+    parser.add_argument('--rule-opponent-rate', type=float, default=0.5)
     parser.add_argument('--queue-size', type=int, default=64)
     parser.add_argument('--torch-threads', type=int, default=1)
     args = parser.parse_args()
@@ -389,7 +407,7 @@ def main():
     weight_path = os.path.join(run_dir, 'latest_model.pt')
     _publish_model(model, weight_path)
 
-    replay = deque(maxlen=args.replay_size)
+    rollout = []
     queue = Queue(maxsize=args.queue_size)
     stop_event = Event()
     actor_devices = [item.strip() for item in args.actor_devices.split(',')
@@ -440,20 +458,25 @@ def main():
             recent['episodes'] += 1
             episodes += 1
             transitions = _from_packed_transitions(transitions)
-            replay.extend(transitions)
+            rollout.extend(transitions)
             frames += len(transitions)
             since_update += len(transitions)
 
-            if len(replay) >= args.min_replay and since_update >= args.update_frames:
-                sample_count = args.batch_size * args.update_batches
-                batch = _sample_replay(replay, sample_count)
+            min_rollout = max(
+                1, args.update_frames,
+                args.min_replay if args.min_replay > 0 else 0)
+            if len(rollout) >= min_rollout and since_update >= args.update_frames:
+                batch = list(rollout)
+                rollout.clear()
                 update_start = time.time()
-                last_update = dmc_update(
+                last_update = ppo_update(
                     model, optimizer, batch, args, learner_device)
                 last_update['update_ms'] = (
                     time.time() - update_start) * 1000.0
-                last_update['update_samples'] = len(batch)
+                last_update['update_samples'] = (
+                    len(batch) * max(1, int(getattr(args, 'ppo_epochs', 1))))
                 since_update = 0
+                _publish_model(model, weight_path)
 
             if next_publish is not None and frames >= next_publish:
                 _publish_model(model, weight_path)
@@ -480,7 +503,8 @@ def main():
                     'frames': frames,
                     'episodes': episodes,
                     'fps': max(0, frames - start_frames) / elapsed,
-                    'replay': len(replay),
+                    'rollout': len(rollout),
+                    'replay': 0,
                     'queue': queue.qsize() if hasattr(queue, 'qsize') else -1,
                     'loss': last_update.get('loss'),
                     'policy_loss': last_update.get('policy_loss'),
